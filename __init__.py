@@ -1,13 +1,14 @@
 # __init__.py
 bl_info = {
-    "name": "Texture Bridge: Camera & UV Exporter",
+    "name": "Blender_Texture_Bridge",
     "author": "XiaoMing",
     "version": (0, 2, 0),
     "blender": (3, 3, 0),
-    "location": "3D Viewport > N 面板 > PS Bridge",
-    "description": "Export And Update Texture for Model.",
+    "location": "3D 视图 > N 面板 > 纹理桥",
+    "description": "在 Blender 与外部绘制流程之间搭建纹理桥：导出相机/视口参数与UV、生成绘制空白画布、基于导出的 JSON 精确重建相机并将3D绘制结果按可见性与深度遮挡投射回模型UV，支持保存可见性遮罩与可调阈值/容差。",
     "category": "Import-Export",
 }
+
 
 import importlib
 import bpy
