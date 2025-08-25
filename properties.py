@@ -145,3 +145,19 @@ class PSB_ExporterProps(bpy.types.PropertyGroup):
         min=0.0, max=1.0,
         default=(1.0, 1.0, 1.0, 0.0)  # 默认白色且完全透明
     )
+
+    # 是否使用 GPU（Cycles）
+    use_gpu: bpy.props.BoolProperty(
+        name="使用GPU（Cycles）",
+        description="启用 Cycles GPU 渲染（需要你的 Blender 首选项中已启用相应显卡设备）",
+        default=True,
+    )
+
+    # 并行进程数（0=自动=CPU核心数）
+    parallel_workers: bpy.props.IntProperty(
+        name="并行进程数",
+        description="并行烘焙的进程数量；0 表示自动（使用 CPU 逻辑核心数）",
+        default=0,
+        min=0,
+        max=64,
+    )

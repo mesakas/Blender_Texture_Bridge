@@ -50,6 +50,7 @@ classes = (
     apply_ops.PSB_OT_ApplyPaint3D,
     apply_ops.PSB_OT_ApplyPaintUV,
     apply_ops.PSB_OT_BakeVisibilityMask,
+    apply_ops.PSB_OT_ApplyPaint3DParallel,
     panel.PSB_PT_Panel,
 )
 

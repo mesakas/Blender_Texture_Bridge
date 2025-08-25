@@ -59,6 +59,12 @@ class PSB_PT_Panel(bpy.types.Panel):
         
         col.prop(props, "bake_background_color", text="烘焙背景（RGBA）")
 
+        col.separator()
+        col.label(text="性能")
+        col.prop(props, "use_gpu", text="使用GPU（Cycles）")
+        col.prop(props, "parallel_workers", text="并行进程数")
+        col.operator("psb.apply_paint3d_parallel", text="并行烘焙（多进程）", icon="SEQUENCE")
+
         if props.baked_path:
             col.separator()
             col.label(text=f"烘焙输出：{props.baked_path}")
