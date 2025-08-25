@@ -1,8 +1,37 @@
+# utils.py
 import os
 import time
 from mathutils import Matrix, Vector
 
 
+# utils.py 末尾附近新增
+
+def pick_bake_targets(props):
+    """
+    根据 props.bake_target_mode 返回要处理的网格对象列表。
+    - SINGLE: 返回 [target_object]（若有效）
+    - COLLECTION: 返回集合中所有 type=='MESH' 的对象（去重）
+    """
+    targets = []
+    mode = getattr(props, "bake_target_mode", "SINGLE")
+    if mode == "COLLECTION":
+        col = getattr(props, "target_collection", None)
+        if col:
+            for o in col.objects:
+                if getattr(o, "type", "") == 'MESH':
+                    targets.append(o)
+    else:
+        obj = getattr(props, "target_object", None)
+        if obj and getattr(obj, "type", "") == 'MESH':
+            targets.append(obj)
+    # 去重（同一个数据块可能被多处引用）
+    uniq = []
+    seen = set()
+    for o in targets:
+        if o.name not in seen:
+            uniq.append(o)
+            seen.add(o.name)
+    return uniq
 
 
 def create_blank_png(width:int, height:int, path:str, color=(0,0,0,0)):

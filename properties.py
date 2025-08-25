@@ -1,6 +1,36 @@
+# properties.py
 import bpy
 
 class PSB_ExporterProps(bpy.types.PropertyGroup):
+
+    bake_target_mode: bpy.props.EnumProperty(
+        name="目标类型",
+        description="选择要对单个物体还是集合进行处理",
+        items=[
+            ("SINGLE", "单个物体", "仅处理下方指定的目标物体"),
+            ("COLLECTION", "集合", "处理集合中的所有网格物体"),
+        ],
+        default="SINGLE",
+    )
+
+    target_collection: bpy.props.PointerProperty(
+        name="目标集合",
+        type=bpy.types.Collection,
+        description="选择一个集合，对其中所有网格物体进行处理"
+    )
+
+    # （其余原有属性保留不变）
+    render_mode: bpy.props.EnumProperty(
+        name="渲染来源",
+        description="选择从相机渲染或从视口抓取",
+        items=[
+            ("CAMERA",   "相机",   "使用所选相机进行渲染"),
+            ("VIEWPORT", "视口",   "抓取第一个 3D 视口进行渲染"),
+        ],
+        default="CAMERA",
+    )
+
+
     render_mode: bpy.props.EnumProperty(
         name="渲染来源",
         description="选择从相机渲染或从视口抓取",
@@ -61,6 +91,16 @@ class PSB_ExporterProps(bpy.types.PropertyGroup):
         name="烘焙输出路径", subtype='FILE_PATH', default=""
     )
 
+    # ====== 3D 烘焙结果中的“未绘制/不可见”背景颜色（含透明度） ======
+    bake_background_color: bpy.props.FloatVectorProperty(
+        name="烘焙背景（RGBA）",
+        description="ApplyPaint3D 的未投射区域将写入此颜色与透明度",
+        subtype='COLOR',
+        size=4,
+        min=0.0, max=1.0,
+        default=(1.0, 1.0, 1.0, 0.0)  # 默认：白+完全透明
+    )
+
     # ====== 可见性/遮挡 控制参数（新增） ======
     mask_visible_color: bpy.props.FloatVectorProperty(
         name="可见颜色",
@@ -94,4 +134,14 @@ class PSB_ExporterProps(bpy.types.PropertyGroup):
         name="反相遮罩（可见=黑）",
         description="勾选：可见=黑，不可见=白；取消：可见=白，不可见=黑",
         default=True
+    )
+
+    # ★ 新增：3D 烘焙未投射区域的背景颜色（含透明度）
+    bake_background_color: bpy.props.FloatVectorProperty(
+        name="烘焙背景（RGBA）",
+        description="ApplyPaint3D 中未被投射/不可见的像素将使用此颜色与透明度",
+        subtype='COLOR',
+        size=4,
+        min=0.0, max=1.0,
+        default=(1.0, 1.0, 1.0, 0.0)  # 默认白色且完全透明
     )

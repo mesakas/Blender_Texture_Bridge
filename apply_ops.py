@@ -10,6 +10,7 @@ from .utils import (
     ensure_uv_map,
     get_active_uv_image_size,
     compute_viewport_calibration,
+    pick_bake_targets,
 )
 
 
@@ -274,24 +275,19 @@ def _camera_from_json(context, meta: dict, paint_w: int, paint_h: int):
 
 # —— 用 JSON 相机做烘焙 —— #
 class PSB_OT_ApplyPaint3D(bpy.types.Operator):
-    """读取 3D 空间绘制后的图片，依据 metadata.json 的内外参进行精确投影并烘焙到 UV。"""
     bl_idname = "psb.apply_paint3d"
     bl_label  = "应用 3D 绘制 → 贴图（按JSON）"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        """
-        读取 3D 绘制图（paint_3d_path），按 metadata.json 中的相机/视口内外参
-        精确重建投影相机，进行“正面 + 深度遮挡”判定后投射到模型并烘焙到 UV。
-        仅保存 PNG，不更新 Blender 材质。
-        （修复：统一到世界空间、最近邻采样深度、关闭 mipmap、稳定阈值）
-        """
         import math
 
-        p   = context.scene.psb_exporter
-        obj = p.target_object
-        if not obj or obj.type != 'MESH':
-            self.report({'ERROR'}, "请选择网格物体"); return {'CANCELLED'}
+        p = context.scene.psb_exporter
+        targets = pick_bake_targets(p)
+        if not targets:
+            self.report({'ERROR'}, "未找到要处理的网格物体（请检查目标类型与目标选择）")
+            return {'CANCELLED'}
+
         if not p.paint_3d_path:
             self.report({'ERROR'}, "未设置 3D 绘制图片路径"); return {'CANCELLED'}
 
@@ -305,7 +301,7 @@ class PSB_OT_ApplyPaint3D(bpy.types.Operator):
         except Exception as e:
             self.report({'ERROR'}, f"读取 JSON 失败：{e}"); return {'CANCELLED'}
 
-        # 源图
+        # 源图（一次准备）
         src_path = bpy.path.abspath(p.paint_3d_path)
         if not src_path or not os.path.exists(src_path):
             self.report({'ERROR'}, f"找不到 3D 绘制图片：{src_path}"); return {'CANCELLED'}
@@ -316,22 +312,21 @@ class PSB_OT_ApplyPaint3D(bpy.types.Operator):
         except: pass
         if hasattr(img_src, "colorspace_settings"):
             img_src.colorspace_settings.name = 'sRGB'
-        # 关闭 mipmap/interp，避免掠射角颜色渗透
         try:
             img_src.use_mipmap = False
-            img_src.use_interpolation = True  # 颜色图保留 Linear 插值
+            img_src.use_interpolation = True
         except: pass
         paint_w, paint_h = int(img_src.size[0]), int(img_src.size[1])
 
-        # 重建相机
+        # 相机（一次重建）
         try:
             cam_obj, cam_data, used = _camera_from_json(context, meta, paint_w, paint_h)
         except Exception as e:
             self.report({'ERROR'}, f"重建相机失败：{e}"); return {'CANCELLED'}
 
-        # 渲染深度图（与源图同分辨率）
+        # 深度（一次渲染）
         out_dir = bpy.path.abspath(p.out_dir); ensure_dir(out_dir)
-        depth_exr_path = os.path.join(out_dir, f"{obj.name}_cam_depth.exr")
+        depth_exr_path = os.path.join(out_dir, f"__psb_cam_depth_once__.exr")
         saved_depth = _render_depth_map(context, cam_obj, paint_w, paint_h, depth_exr_path)
         depth_img = load_image_from_path(saved_depth)
         if not depth_img:
@@ -340,199 +335,272 @@ class PSB_OT_ApplyPaint3D(bpy.types.Operator):
             depth_img.colorspace_settings.name = 'Non-Color'
         try:
             depth_img.use_mipmap = False
-            depth_img.use_interpolation = False  # 与节点上的 Closest 保持一致
+            depth_img.use_interpolation = False
         except: pass
 
-        # 目标贴图尺寸
-        target_w, target_h = get_active_uv_image_size(obj)
-        if not target_w:
-            target_w = target_h = int(p.uv_size)
-        target_img = bpy.data.images.new(name=f"{obj.name}_Baked", width=target_w, height=target_h, alpha=True)
+        # ★ 新增：读取“烘焙背景（RGBA）”配置
+        bg_rgba = tuple(getattr(p, "bake_background_color", (1.0, 1.0, 1.0, 0.0)))
 
-        # UV Project 修饰器（写到临时 UV）
-        proj_uv = ensure_uv_map(obj, "PSB_ProjectedUV")
-        mod = obj.modifiers.new("PSB_UVProject", type='UV_PROJECT')
-        mod.uv_layer = proj_uv
-        proj = mod.projectors
-        if len(proj) < 1: proj.add()
-        proj[0].object = cam_obj
-        mod.aspect_x = float(paint_w) / max(1.0, float(paint_h))
-        mod.aspect_y = 1.0
+        baked_count = 0
+        last_baked_path = ""
 
-        # 备份原材质槽
-        orig_mats = [m for m in obj.data.materials]
-
-        # —— 搭建临时材质（正面 + 深度遮挡，全部世界空间）——
-        mat = bpy.data.materials.new(name="PSB_TempBakeMat")
-        mat.use_nodes = True
-        nt = mat.node_tree
-        for n in list(nt.nodes): nt.nodes.remove(n)
-
-        out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (1060, 0)
-        emi = nt.nodes.new("ShaderNodeEmission");       emi.location = (860, 0)
-
-        # 源图（按临时UV）
-        tex = nt.nodes.new("ShaderNodeTexImage");       tex.location = (40, 0)
-        tex.image = img_src
-        tex.projection = 'FLAT'
-        tex.extension  = 'CLIP'
-        tex.interpolation = 'Linear'
-
-        uvn = nt.nodes.new("ShaderNodeUVMap");          uvn.location = (-220, -150); uvn.uv_map = proj_uv
-        nt.links.new(uvn.outputs["UV"], tex.inputs["Vector"])
-
-        # 深度图采样（同一投影视口 UV）
-        depth_tex = nt.nodes.new("ShaderNodeTexImage"); depth_tex.location = (40, -300)
-        depth_tex.image = depth_img
-        depth_tex.interpolation = 'Closest'   # 避免跨像素插值带来的错误
-        depth_tex.projection = 'FLAT'
-        depth_tex.extension  = 'CLIP'
-        if hasattr(depth_tex, "color_space"):
-            depth_tex.color_space = 'NONE'
-        nt.links.new(uvn.outputs["UV"], depth_tex.inputs["Vector"])
-
-        # 世界空间：Position & Normal
-        geo = nt.nodes.new("ShaderNodeNewGeometry");        geo.location = (-460, -420)
-        pos_xf = nt.nodes.new("ShaderNodeVectorTransform"); pos_xf.location = (-260, -420)
-        pos_xf.vector_type = 'POINT'
-        pos_xf.convert_from = 'OBJECT'
-        pos_xf.convert_to   = 'WORLD'
-        nt.links.new(geo.outputs["Position"], pos_xf.inputs["Vector"])
-
-        nrm_xf = nt.nodes.new("ShaderNodeVectorTransform"); nrm_xf.location = (-260, -520)
-        nrm_xf.vector_type = 'NORMAL'
-        nrm_xf.convert_from = 'OBJECT'
-        nrm_xf.convert_to   = 'WORLD'
-        nt.links.new(geo.outputs["Normal"], nrm_xf.inputs["Vector"])
-
-        # 摄像机位置常量（世界）
-        cam_loc = cam_obj.matrix_world.translation
-        camX = nt.nodes.new("ShaderNodeValue"); camX.location = (-220, -640); camX.outputs[0].default_value = float(cam_loc.x)
-        camY = nt.nodes.new("ShaderNodeValue"); camY.location = (-220, -680); camY.outputs[0].default_value = float(cam_loc.y)
-        camZ = nt.nodes.new("ShaderNodeValue"); camZ.location = (-220, -720); camZ.outputs[0].default_value = float(cam_loc.z)
-        cmb  = nt.nodes.new("ShaderNodeCombineXYZ");       cmb.location  = (-40,  -680)
-        nt.links.new(camX.outputs[0], cmb.inputs[0])
-        nt.links.new(camY.outputs[0], cmb.inputs[1])
-        nt.links.new(camZ.outputs[0], cmb.inputs[2])
-
-        # 视线向量（世界）：normalize(CamPos - WorldPos)
-        vsub = nt.nodes.new("ShaderNodeVectorMath");    vsub.location = (160, -520); vsub.operation = 'SUBTRACT'
-        nt.links.new(cmb.outputs["Vector"],   vsub.inputs[0])  # CamPos
-        nt.links.new(pos_xf.outputs["Vector"], vsub.inputs[1]) # WorldPos
-
-        vnorm = nt.nodes.new("ShaderNodeVectorMath");   vnorm.location = (340, -520); vnorm.operation = 'NORMALIZE'
-        nt.links.new(vsub.outputs["Vector"], vnorm.inputs[0])
-
-        # 点乘：dot( WorldNormal, ViewDir )
-        vdot = nt.nodes.new("ShaderNodeVectorMath");    vdot.location = (520, -520); vdot.operation = 'DOT_PRODUCT'
-        nt.links.new(nrm_xf.outputs["Vector"], vdot.inputs[0])
-        nt.links.new(vnorm.outputs["Vector"], vdot.inputs[1])
-
-        # 正面阈值（默认为 0.5°）
-        tdeg = float(getattr(p, "mask_front_threshold", 0.5) or 0.5)
-        cos_thresh = math.cos(math.radians(90.0 - tdeg))
-        step_face = nt.nodes.new("ShaderNodeMath");     step_face.location = (700, -520); step_face.operation = 'GREATER_THAN'
-        step_face.inputs[1].default_value = cos_thresh
-        nt.links.new(vdot.outputs["Value"], step_face.inputs[0])
-
-        # 距离到相机（世界）
-        dist = nt.nodes.new("ShaderNodeVectorMath");    dist.location = (520, -320); dist.operation = 'LENGTH'
-        nt.links.new(vsub.outputs["Vector"], dist.inputs[0])
-
-        # 自适应 epsilon
-        bbox = [obj.matrix_world @ v.co for v in obj.data.vertices]
-        if bbox:
-            import mathutils
-            mins = mathutils.Vector((min(pv.x for pv in bbox), min(pv.y for pv in bbox), min(pv.z for pv in bbox)))
-            maxs = mathutils.Vector((max(pv.x for pv in bbox), max(pv.y for pv in bbox), max(pv.z for pv in bbox)))
-            diag = (maxs - mins).length
-        else:
-            diag = 1.0
-        eps_prop = float(getattr(p, "depth_epsilon_ratio", 0.001) or 0.001)
-        eps_val = max(1e-6, eps_prop * diag)
-
-        add_eps = nt.nodes.new("ShaderNodeMath");       add_eps.location = (700, -320); add_eps.operation = 'ADD'
-        add_eps.inputs[1].default_value = eps_val
-        nt.links.new(depth_tex.outputs["Color"], add_eps.inputs[0])
-
-        # 深度测试：dist <= depth + eps
-        depth_ok = nt.nodes.new("ShaderNodeMath");      depth_ok.location = (880, -320); depth_ok.operation = 'LESS_THAN'
-        nt.links.new(dist.outputs["Value"],    depth_ok.inputs[0])
-        nt.links.new(add_eps.outputs["Value"], depth_ok.inputs[1])
-
-        # 同时满足：正面 & 深度
-        and_vis = nt.nodes.new("ShaderNodeMath");       and_vis.location = (880, -420); and_vis.operation = 'MULTIPLY'
-        nt.links.new(step_face.outputs["Value"], and_vis.inputs[0])
-        nt.links.new(depth_ok.outputs["Value"],  and_vis.inputs[1])
-
-        # 可选反相
-        mask_socket = and_vis.outputs["Value"]
-        if getattr(p, "mask_invert_facing", False):
-            inv = nt.nodes.new("ShaderNodeMath");       inv.location = (920, -390); inv.operation = 'SUBTRACT'
-            inv.inputs[0].default_value = 1.0
-            nt.links.new(and_vis.outputs["Value"], inv.inputs[1])
-            mask_socket = inv.outputs["Value"]
-
-        # 用掩码混合：Color = mask * TexColor + (1-mask) * 黑
-        mix = nt.nodes.new("ShaderNodeMixRGB");         mix.location = (640, 0)
-        mix.blend_type = 'MIX'
-        mix.inputs["Color1"].default_value = (0.0, 0.0, 0.0, 1.0)
-        nt.links.new(mask_socket,           mix.inputs["Fac"])
-        nt.links.new(tex.outputs["Color"],  mix.inputs["Color2"])
-
-        nt.links.new(mix.outputs["Color"],  emi.inputs["Color"])
-        nt.links.new(emi.outputs["Emission"], out.inputs["Surface"])
-
-        # 目标贴图节点（active 接收烘焙）
-        target_node = nt.nodes.new("ShaderNodeTexImage"); target_node.location = (260, -240)
-        target_node.image = target_img
-        nt.nodes.active = target_node
-
-        # 仅为烘焙临时绑定材质到第 0 槽
-        if not obj.data.materials: obj.data.materials.append(mat)
-        else: obj.data.materials[0] = mat
-
-        # Bake
-        scene = context.scene
-        orig_engine = scene.render.engine
         try:
-            scene.render.engine = 'CYCLES'
-            bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True); context.view_layer.objects.active = obj
-            if hasattr(scene, "cycles"): scene.cycles.samples = 1
-            scene.render.bake.use_clear = True
-            scene.render.bake.use_selected_to_active = False
-            scene.render.bake.margin = 2  # 略收紧 margin，减少跨边溢色
-            bpy.ops.object.bake(type='EMIT')
+            for obj in targets:
+                # 目标贴图尺寸（按各自材质/UV 获取，找不到则用 uv_size）
+                target_w, target_h = get_active_uv_image_size(obj)
+                if not target_w:
+                    target_w = target_h = int(p.uv_size)
+                target_img = bpy.data.images.new(name=f"{obj.name}_Baked", width=target_w, height=target_h, alpha=True)
 
-            # 保存（不回写材质）
-            baked_path = os.path.join(out_dir, f"{obj.name}_baked.png")
-            target_img.filepath_raw = baked_path
-            target_img.file_format = 'PNG'
-            target_img.save()
-            p.baked_path = bpy.path.relpath(baked_path)
+                # ★ 新增：确保 STRAIGHT alpha & sRGB，并预填背景（避免未覆盖像素是黑）
+                try:
+                    target_img.alpha_mode = 'STRAIGHT'
+                    target_img.use_alpha = True
+                    if hasattr(target_img, "colorspace_settings"):
+                        target_img.colorspace_settings.name = 'sRGB'
+                    fill = [bg_rgba[0], bg_rgba[1], bg_rgba[2], bg_rgba[3]] * (target_w * target_h)
+                    target_img.pixels[:] = fill
+                except:
+                    pass
+
+                # UV Project（临时 UV）
+                proj_uv = ensure_uv_map(obj, "PSB_ProjectedUV")
+                mod = obj.modifiers.new("PSB_UVProject", type='UV_PROJECT')
+                mod.uv_layer = proj_uv
+                proj = mod.projectors
+                if len(proj) < 1: proj.add()
+                proj[0].object = cam_obj
+                mod.aspect_x = float(paint_w) / max(1.0, float(paint_h))
+                mod.aspect_y = 1.0
+
+                # 备份材质
+                orig_mats = [m for m in obj.data.materials]
+
+                # —— 临时材质 —— #
+                mat = bpy.data.materials.new(name="PSB_TempBakeMat")
+                mat.use_nodes = True
+                nt = mat.node_tree
+                for n in list(nt.nodes): nt.nodes.remove(n)
+
+                out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (1060, 0)
+                emi = nt.nodes.new("ShaderNodeEmission");       emi.location = (860, 0)
+
+                # tex = nt.nodes.new("ShaderNodeTexImage");       tex.location = (40, 0)
+                # tex.image = img_src
+                # tex.projection = 'FLAT'
+                # tex.extension  = 'CLIP'
+                # tex.interpolation = 'Linear'
+
+                tex = nt.nodes.new("ShaderNodeTexImage");       tex.location = (40, 0)
+                tex.image = img_src
+                tex.projection = 'FLAT'
+                tex.extension  = 'EXTEND'     # ★ 改成 EXTEND，避免边界采样到纯黑
+                tex.interpolation = 'Linear'
+
+                uvn = nt.nodes.new("ShaderNodeUVMap");          uvn.location = (-220, -150); uvn.uv_map = proj_uv
+                nt.links.new(uvn.outputs["UV"], tex.inputs["Vector"])
+
+                depth_tex = nt.nodes.new("ShaderNodeTexImage"); depth_tex.location = (40, -300)
+                depth_tex.image = depth_img
+                depth_tex.interpolation = 'Closest'
+                depth_tex.projection = 'FLAT'
+                depth_tex.extension  = 'CLIP'
+                if hasattr(depth_tex, "color_space"): depth_tex.color_space = 'NONE'
+                nt.links.new(uvn.outputs["UV"], depth_tex.inputs["Vector"])
+
+                # —— 世界空间可见性 —— #
+                geo = nt.nodes.new("ShaderNodeNewGeometry");        geo.location = (-460, -420)
+                pos_xf = nt.nodes.new("ShaderNodeVectorTransform"); pos_xf.location = (-260, -420)
+                pos_xf.vector_type = 'POINT'; pos_xf.convert_from = 'OBJECT'; pos_xf.convert_to = 'WORLD'
+                nt.links.new(geo.outputs["Position"], pos_xf.inputs["Vector"])
+
+                nrm_xf = nt.nodes.new("ShaderNodeVectorTransform"); nrm_xf.location = (-260, -520)
+                nrm_xf.vector_type = 'NORMAL'; nrm_xf.convert_from = 'OBJECT'; nrm_xf.convert_to = 'WORLD'
+                nt.links.new(geo.outputs["Normal"], nrm_xf.inputs["Vector"])
+
+                cam_loc = cam_obj.matrix_world.translation
+                camX = nt.nodes.new("ShaderNodeValue"); camX.outputs[0].default_value = float(cam_loc.x); camX.location = (-220, -640)
+                camY = nt.nodes.new("ShaderNodeValue"); camY.outputs[0].default_value = float(cam_loc.y); camY.location = (-220, -680)
+                camZ = nt.nodes.new("ShaderNodeValue"); camZ.outputs[0].default_value = float(cam_loc.z); camZ.location = (-220, -720)
+                cmb  = nt.nodes.new("ShaderNodeCombineXYZ");       cmb.location  = (-40,  -680)
+                nt.links.new(camX.outputs[0], cmb.inputs[0]); nt.links.new(camY.outputs[0], cmb.inputs[1]); nt.links.new(camZ.outputs[0], cmb.inputs[2])
+
+                vsub = nt.nodes.new("ShaderNodeVectorMath"); vsub.location = (160, -520); vsub.operation = 'SUBTRACT'
+                nt.links.new(cmb.outputs["Vector"], vsub.inputs[0]); nt.links.new(pos_xf.outputs["Vector"], vsub.inputs[1])
+
+                vnorm = nt.nodes.new("ShaderNodeVectorMath"); vnorm.location = (340, -520); vnorm.operation = 'NORMALIZE'
+                nt.links.new(vsub.outputs["Vector"], vnorm.inputs[0])
+
+                vdot = nt.nodes.new("ShaderNodeVectorMath"); vdot.location = (520, -520); vdot.operation = 'DOT_PRODUCT'
+                nt.links.new(nrm_xf.outputs["Vector"], vdot.inputs[0]); nt.links.new(vnorm.outputs["Vector"], vdot.inputs[1])
+
+                tdeg = float(getattr(p, "mask_front_threshold", 0.5) or 0.5)
+                cos_thresh = math.cos(math.radians(90.0 - tdeg))
+                step_face = nt.nodes.new("ShaderNodeMath"); step_face.location = (700, -520); step_face.operation = 'GREATER_THAN'
+                step_face.inputs[1].default_value = cos_thresh
+                nt.links.new(vdot.outputs["Value"], step_face.inputs[0])
+
+                dist = nt.nodes.new("ShaderNodeVectorMath"); dist.location = (520, -320); dist.operation = 'LENGTH'
+                nt.links.new(vsub.outputs["Vector"], dist.inputs[0])
+
+                # epsilon 基于每个 obj 自身包围盒
+                bbox = [obj.matrix_world @ v.co for v in obj.data.vertices]
+                if bbox:
+                    import mathutils
+                    mins = mathutils.Vector((min(pv.x for pv in bbox), min(pv.y for pv in bbox), min(pv.z for pv in bbox)))
+                    maxs = mathutils.Vector((max(pv.x for pv in bbox), max(pv.y for pv in bbox), max(pv.z for pv in bbox)))
+                    diag = (maxs - mins).length
+                else:
+                    diag = 1.0
+                eps_prop = float(getattr(p, "depth_epsilon_ratio", 0.001) or 0.001)
+                eps_val = max(1e-6, eps_prop * diag)
+
+                add_eps = nt.nodes.new("ShaderNodeMath"); add_eps.location = (700, -320); add_eps.operation = 'ADD'
+                add_eps.inputs[1].default_value = eps_val
+                nt.links.new(depth_tex.outputs["Color"], add_eps.inputs[0])
+
+                depth_ok = nt.nodes.new("ShaderNodeMath"); depth_ok.location = (880, -320); depth_ok.operation = 'LESS_THAN'
+                nt.links.new(dist.outputs["Value"], depth_ok.inputs[0]); nt.links.new(add_eps.outputs["Value"], depth_ok.inputs[1])
+
+                and_vis = nt.nodes.new("ShaderNodeMath"); and_vis.location = (880, -420); and_vis.operation = 'MULTIPLY'
+                nt.links.new(step_face.outputs["Value"], and_vis.inputs[0]); nt.links.new(depth_ok.outputs["Value"], and_vis.inputs[1])
+
+                mask_socket = and_vis.outputs["Value"]
+                if getattr(p, "mask_invert_facing", False):
+                    inv = nt.nodes.new("ShaderNodeMath"); inv.location = (920, -390); inv.operation = 'SUBTRACT'
+                    inv.inputs[0].default_value = 1.0
+                    nt.links.new(and_vis.outputs["Value"], inv.inputs[1])
+                    mask_socket = inv.outputs["Value"]
+
+
+                # fac = mask * tex_alpha
+                fac_mul = nt.nodes.new("ShaderNodeMath"); fac_mul.location = (760, -240); fac_mul.operation = 'MULTIPLY'
+                nt.links.new(mask_socket, fac_mul.inputs[0])
+                nt.links.new(tex.outputs["Alpha"], fac_mul.inputs[1])
+
+                # ★ 修改：未投射颜色用可配置背景 RGB（alpha 稍后像素合成写）
+                mix = nt.nodes.new("ShaderNodeMixRGB"); mix.location = (640, 0); mix.blend_type = 'MIX'
+                mix.inputs["Color1"].default_value = (bg_rgba[0], bg_rgba[1], bg_rgba[2], 1.0)
+                # nt.links.new(mask_socket, mix.inputs["Fac"])
+                nt.links.new(fac_mul.outputs["Value"], mix.inputs["Fac"])
+                nt.links.new(tex.outputs["Color"],  mix.inputs["Color2"])
+
+                nt.links.new(mix.outputs["Color"],  emi.inputs["Color"])
+                nt.links.new(emi.outputs["Emission"], out.inputs["Surface"])
+
+                # 接收烘焙（颜色）
+                target_node = nt.nodes.new("ShaderNodeTexImage"); target_node.location = (260, -240)
+                target_node.image = target_img
+                nt.nodes.active = target_node
+
+                # 绑定临时材质
+                if not obj.data.materials: obj.data.materials.append(mat)
+                else: obj.data.materials[0] = mat
+
+                # —— 第一次 Bake：颜色 —— #
+                scene = context.scene
+                orig_engine = scene.render.engine
+                try:
+                    scene.render.engine = 'CYCLES'
+                    bpy.ops.object.select_all(action='DESELECT')
+                    obj.select_set(True); context.view_layer.objects.active = obj
+
+                    if hasattr(scene, "cycles"): scene.cycles.samples = 1
+                    scene.render.bake.use_clear = False
+                    scene.render.bake.use_selected_to_active = False
+                    # ★ 修改：更大的 margin，减少黑缝
+                    scene.render.bake.margin = max(8, int(0.004 * max(target_w, target_h)))
+
+                    bpy.ops.object.bake(type='EMIT')
+
+                    # ★ 第二次：烘焙掩码到临时图
+                    mask_img = bpy.data.images.new(name=f"{obj.name}_BakeMaskTmp", width=target_w, height=target_h, alpha=False)
+                    mask_node = nt.nodes.new("ShaderNodeTexImage"); mask_node.location = (260, -520)
+                    mask_node.image = mask_img
+                    nt.nodes.active = mask_node
+
+                    # 暂时把发光输入改接到 mask_socket
+                    # for link in list(nt.links):
+                    #     if link.to_node == emi and link.to_socket.name == "Color":
+                    #         nt.links.remove(link)
+                    # nt.links.new(mask_socket, emi.inputs["Color"])
+
+                    # bpy.ops.object.bake(type='EMIT')  # 掩码烘焙
+
+                    # 暂时把发光输入改接到 fac_mul（mask * alpha）
+                    for link in list(nt.links):
+                        if link.to_node == emi and link.to_socket.name == "Color":
+                            nt.links.remove(link)
+                    nt.links.new(fac_mul.outputs["Value"], emi.inputs["Color"])
+
+                    bpy.ops.object.bake(type='EMIT')  # 覆盖率烘焙（mask * alpha）
+
+                    # ★ 第三步：连续 alpha 合成（不做0/1阈值）
+                    target_img.pixels[:]  # 确保加载
+                    mask_img.pixels[:]
+                    col_buf = list(target_img.pixels[:])  # RGBA
+                    msk_buf = list(mask_img.pixels[:])    # RGBA（用 R 通道）
+                    bg_a = bg_rgba[3]
+                    px_count = target_w * target_h
+                    for i in range(px_count):
+                        mi = i * 4
+                        m = msk_buf[mi]   # 0..1
+                        if m < 0.0: m = 0.0
+                        elif m > 1.0: m = 1.0
+                        # alpha = m * 1.0 + (1 - m) * bg_a
+                        col_buf[mi+3] = m + (1.0 - m) * bg_a
+                    target_img.pixels[:] = col_buf
+
+                    # 保存（每个物体单独文件）
+                    baked_path = os.path.join(out_dir, f"{obj.name}_baked.png")
+
+                    # ★ 再次确保 STRAIGHT & sRGB & alpha
+                    try:
+                        target_img.alpha_mode = 'STRAIGHT'
+                        target_img.use_alpha = True
+                        if hasattr(target_img, "colorspace_settings"):
+                            target_img.colorspace_settings.name = 'sRGB'
+                    except:
+                        pass
+
+                    target_img.filepath_raw = baked_path
+                    target_img.file_format = 'PNG'
+                    target_img.save()
+                    last_baked_path = baked_path
+                    baked_count += 1
+
+                    # 清理临时 mask 节点/图像
+                    try: nt.nodes.remove(mask_node)
+                    except: pass
+                    try: bpy.data.images.remove(mask_img, do_unlink=True)
+                    except: pass
+
+                finally:
+                    try: obj.modifiers.remove(mod)
+                    except: pass
+                    try:
+                        obj.data.materials.clear()
+                        for m in orig_mats:
+                            obj.data.materials.append(m)
+                    except: pass
+                    try: bpy.data.materials.remove(mat, do_unlink=True)
+                    except: pass
+                    scene.render.engine = orig_engine
 
         finally:
-            # 清理
-            try: obj.modifiers.remove(mod)
-            except: pass
-            try:
-                obj.data.materials.clear()
-                for m in orig_mats:
-                    obj.data.materials.append(m)
-            except: pass
+            # 一次性资源清理
             if cam_data is not None:
                 try: bpy.data.objects.remove(cam_obj, do_unlink=True)
                 except: pass
                 try: bpy.data.cameras.remove(cam_data, do_unlink=True)
                 except: pass
-            try: bpy.data.materials.remove(mat, do_unlink=True)
-            except: pass
-            scene.render.engine = orig_engine
 
-        self.report({'INFO'}, f"已按 JSON 投影并烘焙完成（世界空间+深度遮挡稳定）：{p.baked_path}（模式：{used}）")
+        # 把最后一个的路径回写（兼容你原来的 UI 提示）
+        if last_baked_path:
+            p.baked_path = bpy.path.relpath(last_baked_path)
+
+        self.report({'INFO'}, f"按 JSON 投影并烘焙完成：{baked_count} 个对象（模式：{used}）")
         return {'FINISHED'}
-
 
 
 def _make_temp_projector_camera(context, mode: str, camera_obj, vp_calib, width:int, height:int):
@@ -713,7 +781,9 @@ class PSB_OT_CreateBlankCanvases(bpy.types.Operator):
             w = int(s.render.resolution_x * (s.render.resolution_percentage / 100.0))
             h = int(s.render.resolution_y * (s.render.resolution_percentage / 100.0))
         paint3d_path = os.path.join(out_dir, f"{p.target_object.name}_paint_3d.png")
-        create_blank_png(w, h, paint3d_path)
+        # create_blank_png(w, h, paint3d_path)
+        create_blank_png(w, h, paint3d_path, color=tuple(context.scene.psb_exporter.bake_background_color))
+
 
         p.paint_uv_path = bpy.path.relpath(uv_path)
         p.paint_3d_path = bpy.path.relpath(paint3d_path)
@@ -723,16 +793,16 @@ class PSB_OT_CreateBlankCanvases(bpy.types.Operator):
 
 
 class PSB_OT_ApplyPaintUV(bpy.types.Operator):
-    """将 UV 绘制图片直接作为模型贴图绑定到材质。"""
     bl_idname = "psb.apply_paintuv"
     bl_label  = "应用 UV 绘制 → 贴图"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        p   = context.scene.psb_exporter
-        obj = p.target_object
-        if not obj or obj.type != 'MESH':
-            self.report({'ERROR'}, "请选择网格物体"); return {'CANCELLED'}
+        p = context.scene.psb_exporter
+        targets = pick_bake_targets(p)
+        if not targets:
+            self.report({'ERROR'}, "未找到要处理的网格物体（请检查目标类型与目标选择）")
+            return {'CANCELLED'}
         if not p.paint_uv_path:
             self.report({'ERROR'}, "未设置 UV 绘制图片路径"); return {'CANCELLED'}
 
@@ -740,33 +810,25 @@ class PSB_OT_ApplyPaintUV(bpy.types.Operator):
         if not img:
             self.report({'ERROR'}, "无法加载 UV 绘制图片"); return {'CANCELLED'}
 
-        assign_image_to_basecolor(obj, img)
-        self.report({'INFO'}, "已将 UV 绘制图片绑定到材质")
+        for obj in targets:
+            assign_image_to_basecolor(obj, img)
+
+        self.report({'INFO'}, f"已将 UV 绘制图片绑定到 {len(targets)} 个物体的材质")
         return {'FINISHED'}
 
 
 class PSB_OT_BakeVisibilityMask(bpy.types.Operator):
-    """
-    按 metadata.json 重建相机 → UV Project 投影，
-    仅烘焙“可见性遮罩”到一张图片（默认：可见=白，不可见=黑）。
-    使用 摄像机位置·法线 的点乘 + 阈值判定正面。
-    """
     bl_idname = "psb.bake_visibility_mask"
     bl_label  = "保存可见性遮罩"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        """
-        仅烘焙“可见性遮罩”到一张图片（默认：可见=黑，不可见=白，可配置）。
-        可见性的定义：正面判定（世界空间） + 深度可见（通过 Z 深度测试）。
-        （修复：统一到世界空间、最近邻采样深度、关闭 mipmap、稳定阈值）
-        """
         import math
-
-        p   = context.scene.psb_exporter
-        obj = p.target_object
-        if not obj or obj.type != 'MESH':
-            self.report({'ERROR'}, "请选择网格物体"); return {'CANCELLED'}
+        p = context.scene.psb_exporter
+        targets = pick_bake_targets(p)
+        if not targets:
+            self.report({'ERROR'}, "未找到要处理的网格物体（请检查目标类型与目标选择）")
+            return {'CANCELLED'}
 
         # 读取 JSON
         meta_path = bpy.path.abspath(p.meta_path)
@@ -778,23 +840,20 @@ class PSB_OT_BakeVisibilityMask(bpy.types.Operator):
         except Exception as e:
             self.report({'ERROR'}, f"读取 JSON 失败：{e}"); return {'CANCELLED'}
 
-        # 目标贴图尺寸
-        target_w, target_h = get_active_uv_image_size(obj)
-        if not target_w:
-            target_w = target_h = int(p.uv_size)
-        target_img = bpy.data.images.new(name=f"{obj.name}_VisMask", width=target_w, height=target_h, alpha=True)
+        out_dir = bpy.path.abspath(p.out_dir); ensure_dir(out_dir)
 
-        # 重建相机（深度图尺寸：沿用 metadata 视口尺寸或目标）
-        paint_w = int(meta.get("viewport_params",{}).get("width")  or target_w)
-        paint_h = int(meta.get("viewport_params",{}).get("height") or target_h)
+        # 用 meta 中视口尺寸或回退 uv_size 作为深度图尺寸（一次）
+        paint_w = int(meta.get("viewport_params",{}).get("width")  or p.uv_size)
+        paint_h = int(meta.get("viewport_params",{}).get("height") or p.uv_size)
+
+        # 相机（一次重建）
         try:
             cam_obj, cam_data, used = _camera_from_json(context, meta, paint_w, paint_h)
         except Exception as e:
             self.report({'ERROR'}, f"重建相机失败：{e}"); return {'CANCELLED'}
 
-        # 深度图
-        out_dir = bpy.path.abspath(p.out_dir); ensure_dir(out_dir)
-        depth_exr_path = os.path.join(out_dir, f"{obj.name}_cam_depth.exr")
+        # 深度（一次渲染）
+        depth_exr_path = os.path.join(out_dir, f"__psb_cam_depth_once__.exr")
         saved_depth = _render_depth_map(context, cam_obj, paint_w, paint_h, depth_exr_path)
         depth_img = load_image_from_path(saved_depth)
         if not depth_img:
@@ -806,175 +865,163 @@ class PSB_OT_BakeVisibilityMask(bpy.types.Operator):
             depth_img.use_interpolation = False
         except: pass
 
-        # UV Project（写入临时 UV）
-        proj_uv = ensure_uv_map(obj, "PSB_ProjectedUV")
-        mod = obj.modifiers.new("PSB_UVProject", type='UV_PROJECT')
-        mod.uv_layer = proj_uv
-        proj = mod.projectors
-        if len(proj) < 1: proj.add()
-        proj[0].object = cam_obj
-        mod.aspect_x = float(paint_w) / max(1.0, float(paint_h))
-        mod.aspect_y = 1.0
+        saved_count = 0
+        last_mask_path = ""
 
-        # 备份原材质槽
-        orig_mats = [m for m in obj.data.materials]
-
-        # —— 节点：输出“可见性掩码”（颜色可配置），全部世界空间 —— #
-        mat = bpy.data.materials.new(name="PSB_VisMaskBakeMat")
-        mat.use_nodes = True
-        nt = mat.node_tree
-        for n in list(nt.nodes): nt.nodes.remove(n)
-
-        out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (980, 0)
-        emi = nt.nodes.new("ShaderNodeEmission");       emi.location = (780, 0)
-
-        # 世界空间 Position & Normal
-        geo = nt.nodes.new("ShaderNodeNewGeometry");        geo.location = (-460, -420)
-        pos_xf = nt.nodes.new("ShaderNodeVectorTransform"); pos_xf.location = (-260, -420)
-        pos_xf.vector_type = 'POINT'
-        pos_xf.convert_from = 'OBJECT'
-        pos_xf.convert_to   = 'WORLD'
-        nt.links.new(geo.outputs["Position"], pos_xf.inputs["Vector"])
-
-        nrm_xf = nt.nodes.new("ShaderNodeVectorTransform"); nrm_xf.location = (-260, -520)
-        nrm_xf.vector_type = 'NORMAL'
-        nrm_xf.convert_from = 'OBJECT'
-        nrm_xf.convert_to   = 'WORLD'
-        nt.links.new(geo.outputs["Normal"], nrm_xf.inputs["Vector"])
-
-        # 摄像机位置（世界）
-        cam_loc = cam_obj.matrix_world.translation
-        camX = nt.nodes.new("ShaderNodeValue"); camX.location = (-220, -640); camX.outputs[0].default_value = float(cam_loc.x)
-        camY = nt.nodes.new("ShaderNodeValue"); camY.location = (-220, -680); camY.outputs[0].default_value = float(cam_loc.y)
-        camZ = nt.nodes.new("ShaderNodeValue"); camZ.location = (-220, -720); camZ.outputs[0].default_value = float(cam_loc.z)
-        cmb  = nt.nodes.new("ShaderNodeCombineXYZ");       cmb.location  = (-40,  -680)
-        nt.links.new(camX.outputs[0], cmb.inputs[0])
-        nt.links.new(camY.outputs[0], cmb.inputs[1])
-        nt.links.new(camZ.outputs[0], cmb.inputs[2])
-
-        # 视线向量（世界）
-        vsub = nt.nodes.new("ShaderNodeVectorMath");    vsub.location = (160, -520); vsub.operation = 'SUBTRACT'
-        nt.links.new(cmb.outputs["Vector"],   vsub.inputs[0])
-        nt.links.new(pos_xf.outputs["Vector"], vsub.inputs[1])
-
-        vnorm = nt.nodes.new("ShaderNodeVectorMath");   vnorm.location = (340, -520); vnorm.operation = 'NORMALIZE'
-        nt.links.new(vsub.outputs["Vector"], vnorm.inputs[0])
-
-        vdot = nt.nodes.new("ShaderNodeVectorMath");    vdot.location = (520, -520); vdot.operation = 'DOT_PRODUCT'
-        nt.links.new(nrm_xf.outputs["Vector"], vdot.inputs[0])
-        nt.links.new(vnorm.outputs["Vector"], vdot.inputs[1])
-
-        # 正面阈值（默认 0.5°）
-        tdeg = float(getattr(p, "mask_front_threshold", 0.5) or 0.5)
-        cos_thresh = math.cos(math.radians(90.0 - tdeg))
-        step_face = nt.nodes.new("ShaderNodeMath");     step_face.location = (700, -520); step_face.operation = 'GREATER_THAN'
-        step_face.inputs[1].default_value = cos_thresh
-        nt.links.new(vdot.outputs["Value"], step_face.inputs[0])
-
-        # 深度贴图（最近邻、clip）
-        depth_tex = nt.nodes.new("ShaderNodeTexImage"); depth_tex.location = (40, -300)
-        depth_tex.image = depth_img
-        depth_tex.interpolation = 'Closest'
-        depth_tex.projection = 'FLAT'
-        depth_tex.extension  = 'CLIP'
-        if hasattr(depth_tex, "color_space"):
-            depth_tex.color_space = 'NONE'
-        uvn = nt.nodes.new("ShaderNodeUVMap");          uvn.location = (-220, -150); uvn.uv_map = proj_uv
-        nt.links.new(uvn.outputs["UV"], depth_tex.inputs["Vector"])
-
-        # 自适应 epsilon
-        bbox = [obj.matrix_world @ v.co for v in obj.data.vertices]
-        if bbox:
-            import mathutils
-            mins = mathutils.Vector((min(pv.x for pv in bbox), min(pv.y for pv in bbox), min(pv.z for pv in bbox)))
-            maxs = mathutils.Vector((max(pv.x for pv in bbox), max(pv.y for pv in bbox), max(pv.z for pv in bbox)))
-            diag = (maxs - mins).length
-        else:
-            diag = 1.0
-        eps_prop = float(getattr(p, "depth_epsilon_ratio", 0.001) or 0.001)
-        eps_val = max(1e-6, eps_prop * diag)
-
-        # 距离到相机
-        dist = nt.nodes.new("ShaderNodeVectorMath");    dist.location = (520, -320); dist.operation = 'LENGTH'
-        nt.links.new(vsub.outputs["Vector"], dist.inputs[0])
-
-        add_eps = nt.nodes.new("ShaderNodeMath");       add_eps.location = (700, -320); add_eps.operation = 'ADD'
-        add_eps.inputs[1].default_value = eps_val
-        nt.links.new(depth_tex.outputs["Color"], add_eps.inputs[0])
-
-        depth_ok = nt.nodes.new("ShaderNodeMath");      depth_ok.location = (880, -320); depth_ok.operation = 'LESS_THAN'
-        nt.links.new(dist.outputs["Value"],    depth_ok.inputs[0])
-        nt.links.new(add_eps.outputs["Value"], depth_ok.inputs[1])
-
-        and_vis = nt.nodes.new("ShaderNodeMath");       and_vis.location = (880, -420); and_vis.operation = 'MULTIPLY'
-        nt.links.new(step_face.outputs["Value"], and_vis.inputs[0])
-        nt.links.new(depth_ok.outputs["Value"],  and_vis.inputs[1])
-
-        # 可选反相（默认 True：可见=黑，不可见=白；若你改为 False 则反过来）
-        mask_socket = and_vis.outputs["Value"]
-        if getattr(p, "mask_invert_facing", True):
-            inv = nt.nodes.new("ShaderNodeMath");       inv.location = (920, -390); inv.operation = 'SUBTRACT'
-            inv.inputs[0].default_value = 1.0
-            nt.links.new(and_vis.outputs["Value"], inv.inputs[1])
-            mask_socket = inv.outputs["Value"]
-
-        vis = tuple(getattr(p, "mask_visible_color", (0.0,0.0,0.0,1.0)))
-        hid = tuple(getattr(p, "mask_hidden_color", (1.0,1.0,1.0,1.0)))
-
-        mix = nt.nodes.new("ShaderNodeMixRGB");         mix.location = (640, 0)
-        mix.blend_type = 'MIX'
-        mix.inputs["Color1"].default_value = hid
-        mix.inputs["Color2"].default_value = vis
-        nt.links.new(mask_socket, mix.inputs["Fac"])
-
-        nt.links.new(mix.outputs["Color"],  emi.inputs["Color"])
-        nt.links.new(emi.outputs["Emission"], out.inputs["Surface"])
-
-        # 目标贴图节点（接收烘焙）
-        target_node = nt.nodes.new("ShaderNodeTexImage"); target_node.location = (260, -240)
-        target_node.image = target_img
-        nt.nodes.active = target_node
-
-        # 绑定临时材质
-        if not obj.data.materials: obj.data.materials.append(mat)
-        else: obj.data.materials[0] = mat
-
-        # Bake
-        scene = context.scene
-        orig_engine = scene.render.engine
         try:
-            scene.render.engine = 'CYCLES'
-            bpy.ops.object.select_all(action='DESELECT')
-            obj.select_set(True); context.view_layer.objects.active = obj
-            if hasattr(scene, "cycles"): scene.cycles.samples = 1
-            scene.render.bake.use_clear = True
-            scene.render.bake.use_selected_to_active = False
-            scene.render.bake.margin = 2
-            bpy.ops.object.bake(type='EMIT')
+            for obj in targets:
+                # 目标贴图尺寸（按各自材质/UV 获取，找不到则用 uv_size）
+                target_w, target_h = get_active_uv_image_size(obj)
+                if not target_w:
+                    target_w = target_h = int(p.uv_size)
+                target_img = bpy.data.images.new(name=f"{obj.name}_VisMask", width=target_w, height=target_h, alpha=True)
 
-            # 保存
-            mask_path = os.path.join(out_dir, f"{obj.name}_visibility_mask.png")
-            target_img.filepath_raw = mask_path
-            target_img.file_format = 'PNG'
-            target_img.save()
-            p.mask_path = bpy.path.relpath(mask_path)
+                # UV Project
+                proj_uv = ensure_uv_map(obj, "PSB_ProjectedUV")
+                mod = obj.modifiers.new("PSB_UVProject", type='UV_PROJECT')
+                mod.uv_layer = proj_uv
+                proj = mod.projectors
+                if len(proj) < 1: proj.add()
+                proj[0].object = cam_obj
+                mod.aspect_x = float(paint_w) / max(1.0, float(paint_h))
+                mod.aspect_y = 1.0
+
+                # 备份材质槽
+                orig_mats = [m for m in obj.data.materials]
+
+                # —— 构建只输出可见性颜色的材质（复用你原逻辑）——
+                # 省略：节点构建与上面一致（正面判定 + 深度测试）
+                # 与你原版相同，仅在保存时使用每个 obj 的名字
+                # （为了避免重复贴长代码，这里建议直接复制你现有 execute 中“节点构建”段落）
+
+                # === 直接复用你现有的节点构建代码块（从这里起到烘焙结束），唯一差异是保存路径： ===
+                mat = bpy.data.materials.new(name="PSB_VisMaskBakeMat")
+                mat.use_nodes = True
+                nt = mat.node_tree
+                for n in list(nt.nodes): nt.nodes.remove(n)
+                out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (980, 0)
+                emi = nt.nodes.new("ShaderNodeEmission");       emi.location = (780, 0)
+
+                geo = nt.nodes.new("ShaderNodeNewGeometry");        geo.location = (-460, -420)
+                pos_xf = nt.nodes.new("ShaderNodeVectorTransform"); pos_xf.location = (-260, -420)
+                pos_xf.vector_type = 'POINT'; pos_xf.convert_from = 'OBJECT'; pos_xf.convert_to = 'WORLD'
+                nt.links.new(geo.outputs["Position"], pos_xf.inputs["Vector"])
+                nrm_xf = nt.nodes.new("ShaderNodeVectorTransform"); nrm_xf.location = (-260, -520)
+                nrm_xf.vector_type = 'NORMAL'; nrm_xf.convert_from = 'OBJECT'; nrm_xf.convert_to = 'WORLD'
+                nt.links.new(geo.outputs["Normal"], nrm_xf.inputs["Vector"])
+
+                cam_loc = cam_obj.matrix_world.translation
+                camX = nt.nodes.new("ShaderNodeValue"); camX.location = (-220, -640); camX.outputs[0].default_value = float(cam_loc.x)
+                camY = nt.nodes.new("ShaderNodeValue"); camY.location = (-220, -680); camY.outputs[0].default_value = float(cam_loc.y)
+                camZ = nt.nodes.new("ShaderNodeValue"); camZ.location = (-220, -720); camZ.outputs[0].default_value = float(cam_loc.z)
+                cmb  = nt.nodes.new("ShaderNodeCombineXYZ");       cmb.location  = (-40,  -680)
+                nt.links.new(camX.outputs[0], cmb.inputs[0]); nt.links.new(camY.outputs[0], cmb.inputs[1]); nt.links.new(camZ.outputs[0], cmb.inputs[2])
+
+                vsub = nt.nodes.new("ShaderNodeVectorMath"); vsub.location = (160, -520); vsub.operation = 'SUBTRACT'
+                nt.links.new(cmb.outputs["Vector"],   vsub.inputs[0]); nt.links.new(pos_xf.outputs["Vector"], vsub.inputs[1])
+                vnorm = nt.nodes.new("ShaderNodeVectorMath"); vnorm.location = (340, -520); vnorm.operation = 'NORMALIZE'
+                nt.links.new(vsub.outputs["Vector"], vnorm.inputs[0])
+                vdot = nt.nodes.new("ShaderNodeVectorMath"); vdot.location = (520, -520); vdot.operation = 'DOT_PRODUCT'
+                nt.links.new(nrm_xf.outputs["Vector"], vdot.inputs[0]); nt.links.new(vnorm.outputs["Vector"], vdot.inputs[1])
+
+                tdeg = float(getattr(p, "mask_front_threshold", 0.5) or 0.5)
+                cos_thresh = math.cos(math.radians(90.0 - tdeg))
+                step_face = nt.nodes.new("ShaderNodeMath"); step_face.location = (700, -520); step_face.operation = 'GREATER_THAN'
+                step_face.inputs[1].default_value = cos_thresh
+                nt.links.new(vdot.outputs["Value"], step_face.inputs[0])
+
+                depth_tex = nt.nodes.new("ShaderNodeTexImage"); depth_tex.location = (40, -300)
+                depth_tex.image = depth_img; depth_tex.interpolation = 'Closest'; depth_tex.projection = 'FLAT'; depth_tex.extension = 'CLIP'
+                if hasattr(depth_tex, "color_space"): depth_tex.color_space = 'NONE'
+                uvn = nt.nodes.new("ShaderNodeUVMap"); uvn.location = (-220, -150); uvn.uv_map = proj_uv
+                nt.links.new(uvn.outputs["UV"], depth_tex.inputs["Vector"])
+
+                bbox = [obj.matrix_world @ v.co for v in obj.data.vertices]
+                if bbox:
+                    import mathutils
+                    mins = mathutils.Vector((min(pv.x for pv in bbox), min(pv.y for pv in bbox), min(pv.z for pv in bbox)))
+                    maxs = mathutils.Vector((max(pv.x for pv in bbox), max(pv.y for pv in bbox), max(pv.z for pv in bbox)))
+                    diag = (maxs - mins).length
+                else:
+                    diag = 1.0
+                eps_prop = float(getattr(p, "depth_epsilon_ratio", 0.001) or 0.001)
+                eps_val = max(1e-6, eps_prop * diag)
+
+                dist = nt.nodes.new("ShaderNodeVectorMath"); dist.location = (520, -320); dist.operation = 'LENGTH'
+                nt.links.new(vsub.outputs["Vector"], dist.inputs[0])
+                add_eps = nt.nodes.new("ShaderNodeMath"); add_eps.location = (700, -320); add_eps.operation = 'ADD'
+                add_eps.inputs[1].default_value = eps_val
+                nt.links.new(depth_tex.outputs["Color"], add_eps.inputs[0])
+
+                depth_ok = nt.nodes.new("ShaderNodeMath"); depth_ok.location = (880, -320); depth_ok.operation = 'LESS_THAN'
+                nt.links.new(dist.outputs["Value"], depth_ok.inputs[0]); nt.links.new(add_eps.outputs["Value"], depth_ok.inputs[1])
+
+                and_vis = nt.nodes.new("ShaderNodeMath"); and_vis.location = (880, -420); and_vis.operation = 'MULTIPLY'
+                nt.links.new(step_face.outputs["Value"], and_vis.inputs[0]); nt.links.new(depth_ok.outputs["Value"], and_vis.inputs[1])
+
+                mask_socket = and_vis.outputs["Value"]
+                if getattr(p, "mask_invert_facing", True):
+                    inv = nt.nodes.new("ShaderNodeMath"); inv.location = (920, -390); inv.operation = 'SUBTRACT'
+                    inv.inputs[0].default_value = 1.0
+                    nt.links.new(and_vis.outputs["Value"], inv.inputs[1])
+                    mask_socket = inv.outputs["Value"]
+
+                vis = tuple(getattr(p, "mask_visible_color", (0.0,0.0,0.0,1.0)))
+                hid = tuple(getattr(p, "mask_hidden_color", (1.0,1.0,1.0,1.0)))
+                mix = nt.nodes.new("ShaderNodeMixRGB"); mix.location = (640, 0); mix.blend_type = 'MIX'
+                mix.inputs["Color1"].default_value = hid
+                mix.inputs["Color2"].default_value = vis
+                nt.links.new(mask_socket, mix.inputs["Fac"])
+                nt.links.new(mix.outputs["Color"],  emi.inputs["Color"])
+                nt.links.new(emi.outputs["Emission"], out.inputs["Surface"])
+
+                target_node = nt.nodes.new("ShaderNodeTexImage"); target_node.location = (260, -240)
+                target_node.image = target_img
+                nt.nodes.active = target_node
+
+                if not obj.data.materials: obj.data.materials.append(mat)
+                else: obj.data.materials[0] = mat
+
+                # Bake
+                scene = context.scene
+                orig_engine = scene.render.engine
+                try:
+                    scene.render.engine = 'CYCLES'
+                    bpy.ops.object.select_all(action='DESELECT')
+                    obj.select_set(True); context.view_layer.objects.active = obj
+                    if hasattr(scene, "cycles"): scene.cycles.samples = 1
+                    scene.render.bake.use_clear = True
+                    scene.render.bake.use_selected_to_active = False
+                    scene.render.bake.margin = 2
+                    bpy.ops.object.bake(type='EMIT')
+
+                    mask_path = os.path.join(out_dir, f"{obj.name}_visibility_mask.png")
+                    target_img.filepath_raw = mask_path
+                    target_img.file_format = 'PNG'
+                    target_img.save()
+                    last_mask_path = mask_path
+                    saved_count += 1
+
+                finally:
+                    try: obj.modifiers.remove(mod)
+                    except: pass
+                    try:
+                        obj.data.materials.clear()
+                        for m in orig_mats:
+                            obj.data.materials.append(m)
+                    except: pass
+                    try: bpy.data.materials.remove(mat, do_unlink=True)
+                    except: pass
+                    scene.render.engine = orig_engine
 
         finally:
-            try: obj.modifiers.remove(mod)
-            except: pass
-            try:
-                obj.data.materials.clear()
-                for m in orig_mats:
-                    obj.data.materials.append(m)
-            except: pass
             if cam_data is not None:
                 try: bpy.data.objects.remove(cam_obj, do_unlink=True)
                 except: pass
                 try: bpy.data.cameras.remove(cam_data, do_unlink=True)
                 except: pass
-            try: bpy.data.materials.remove(mat, do_unlink=True)
-            except: pass
-            scene.render.engine = orig_engine
 
-        self.report({'INFO'}, f"已保存可见性遮罩：{p.mask_path}（模式：{used}）")
+        if last_mask_path:
+            p.mask_path = bpy.path.relpath(last_mask_path)
+        self.report({'INFO'}, f"已保存可见性遮罩：{saved_count} 个对象（模式：{used}）")
         return {'FINISHED'}

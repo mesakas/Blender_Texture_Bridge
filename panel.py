@@ -22,7 +22,14 @@ class PSB_PT_Panel(bpy.types.Panel):
         else:
             col.prop(props, "camera", text="相机")
 
-        col.prop(props, "target_object", text="目标物体")
+        # === 新增：目标类型选择 + 动态输入 ===
+        col.separator()
+        col.prop(props, "bake_target_mode", text="目标类型")
+        if props.bake_target_mode == "SINGLE":
+            col.prop(props, "target_object", text="目标物体")
+        else:
+            col.prop(props, "target_collection", text="目标集合")
+
         col.prop(props, "out_dir", text="输出目录")
         col.prop(props, "uv_size", text="UV 导出尺寸")
         col.prop(props, "meta_path", text="Metadata JSON 路径")
@@ -49,6 +56,8 @@ class PSB_PT_Panel(bpy.types.Panel):
         col.prop(props, "mask_front_threshold", text="正面阈值（度）")
         col.prop(props, "depth_epsilon_ratio", text="深度容差（比例）")
         col.prop(props, "mask_invert_facing", text="反相遮罩（可见=黑）")
+        
+        col.prop(props, "bake_background_color", text="烘焙背景（RGBA）")
 
         if props.baked_path:
             col.separator()
