@@ -257,15 +257,16 @@ class PSB_OT_Export(bpy.types.Operator):
         except Exception:
             viewport_calib = None
 
-        # -------- 为每个物体生成：物体名_paint_uv.png --------
+        # -------- 为每个物体导出：UV 示意图（线框轮廓）到 out_dir/uv/ --------
         per_object_entries = []
-        first_uv_canvas_abs = ""
+        uv_dir = os.path.join(out_dir, "uv")
+        ensure_dir(uv_dir)
         for obj in targets:
             try:
-                uv_canvas_path = os.path.join(out_dir, f"{obj.name}_paint_uv.png")
-                create_blank_png(uv_size, uv_size, uv_canvas_path)
+                # 导出活动 UV 的轮廓图（示意图）
+                uv_png_path = export_uv_layout_png(obj, uv_dir, obj.name, size=uv_size)
 
-                # UV 数据（用于写入 metadata）
+                # UV 数据（用于写入 metadata；如不需要可删掉 uv_data 字段）
                 uv_data = collect_object_uv_data(obj)
 
                 # 物体信息
@@ -276,20 +277,20 @@ class PSB_OT_Export(bpy.types.Operator):
                     "matrix_world": mat4_to_list(obj.matrix_world),
                     "bbox_world": bbox_world,
                     "data_name": obj.data.name,
-                    "paint_uv_path": uv_canvas_path,   # 绝对路径
-                    "uv_data": uv_data,                # 直接存数组（如需体积可删掉）
+                    # "uv_layout_path": os.path.abspath(uv_png_path),  # UV 示意图的绝对路径
+                    "uv_layout_path": os.path.relpath(uv_png_path, out_dir) if uv_png_path.startswith(out_dir) else uv_png_path,
+                    "uv_data": uv_data,
                 }
                 per_object_entries.append(obj_info)
 
-                if not first_uv_canvas_abs:
-                    first_uv_canvas_abs = uv_canvas_path
             except Exception as e:
-                self.report({'WARNING'}, f"{obj.name} 生成 UV 画布失败：{e}")
+                self.report({'WARNING'}, f"{obj.name} 导出 UV 示意图失败：{e}")
                 continue
 
         if not per_object_entries:
-            self.report({'ERROR'}, "未能为任何对象生成 UV 画布")
+            self.report({'ERROR'}, "未能为任何对象导出 UV 示意图")
             return {'CANCELLED'}
+        
 
         # -------- 写单一 metadata：Blender文件名_metadata.json --------
         meta = {
@@ -345,9 +346,8 @@ class PSB_OT_Export(bpy.types.Operator):
             props.paint_3d_path = os.path.abspath(paint3d_path)
         except: pass
         # UV 画布有多张，这里写回第一张，便于 UI 快速预览/修改
-        if first_uv_canvas_abs:
-            try: props.paint_uv_path = os.path.abspath(first_uv_canvas_abs)
-            except: pass
+        try: props.paint_uv_path = ""
+        except: pass
 
         self.report({'INFO'}, f"导出完成：图像与 3D 画布基于“{camera_name}”，{len(per_object_entries)} 个 UV 画布，元数据：{blend_base}_metadata.json")
         return {'FINISHED'}
@@ -375,7 +375,7 @@ def _enable_cycles_gpu_local(scene):
 
 
 class PSB_OT_RenderCameraMask(bpy.types.Operator):
-    """导出选中物体/集合在【相机】视角下的遮罩（对象为白，背景透明）"""
+    """导出选中物体/集合在【相机】视角下的遮罩（对象=白，背景=黑，纯黑白PNG）"""
     bl_idname = "psb.render_camera_mask"
     bl_label  = "导出相机视角遮罩"
     bl_options = {'REGISTER', 'UNDO'}
@@ -397,13 +397,12 @@ class PSB_OT_RenderCameraMask(bpy.types.Operator):
         ensure_dir(out_dir)
 
         camera_name = cam.name
-        # 命名：<相机名>_camera_mask.png（固定文件名，允许覆盖）
         out_path_noext = os.path.join(out_dir, f"{camera_name}_camera_mask")
 
         scene = context.scene
         view_layer = scene.view_layers[0]
 
-        # 记录现场
+        # —— 记录现场 —— #
         orig_cam = scene.camera
         orig_engine = scene.render.engine
         orig_filepath = scene.render.filepath
@@ -415,17 +414,38 @@ class PSB_OT_RenderCameraMask(bpy.types.Operator):
         orig_override = view_layer.material_override
         orig_hide_map = {obj: obj.hide_render for obj in bpy.data.objects}
 
-        # 临时白色发光材质
-        mat = bpy.data.materials.new("PSB_Mask_White")
+        cm = scene.view_settings
+        orig_view_transform = cm.view_transform
+        orig_look = cm.look
+        orig_exposure = cm.exposure
+        orig_gamma = cm.gamma
+
+        world = scene.world
+        orig_world_use_nodes = getattr(world, "use_nodes", False) if world else False
+        orig_world_color = tuple(world.color) if (world and not orig_world_use_nodes) else None
+        bg_node = None
+        orig_bg_col = None
+        orig_bg_strength = None
+        if world and orig_world_use_nodes and world.node_tree:
+            bg_node = world.node_tree.nodes.get("Background")
+            if bg_node:
+                if "Color" in bg_node.inputs:
+                    orig_bg_col = tuple(bg_node.inputs["Color"].default_value)
+                if "Strength" in bg_node.inputs:
+                    orig_bg_strength = float(bg_node.inputs["Strength"].default_value)
+
+        # —— 临时“纯白”材质（不会受灯光影响） —— #
+        mat = bpy.data.materials.new("PSB_Mask_PureWhite")
         mat.use_nodes = True
         nt = mat.node_tree
         for n in list(nt.nodes): nt.nodes.remove(n)
         out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (200, 0)
         emi = nt.nodes.new("ShaderNodeEmission"); emi.location = (0, 0)
-        emi.inputs["Color"].default_value = (1, 1, 1, 1)
+        emi.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)  # 纯白
         emi.inputs["Strength"].default_value = 1.0
         nt.links.new(emi.outputs["Emission"], out.inputs["Surface"])
 
+        # （可选）本地启用 Cycles GPU（遮罩渲染可独立配置）
         def _enable_cycles_gpu_local(scene):
             try:
                 prefs = bpy.context.preferences
@@ -447,7 +467,6 @@ class PSB_OT_RenderCameraMask(bpy.types.Operator):
         try:
             scene.camera = cam
             scene.render.engine = 'CYCLES'
-            # 独立配置导出环节是否用 GPU（优先 use_gpu_export；否则退回 use_gpu）
             if getattr(props, "use_gpu_export", getattr(props, "use_gpu", False)):
                 _enable_cycles_gpu_local(scene)
 
@@ -455,12 +474,28 @@ class PSB_OT_RenderCameraMask(bpy.types.Operator):
             for obj in bpy.data.objects:
                 obj.hide_render = (obj not in targets)
 
-            # 材质覆盖 + 背景透明，输出 RGBA
+            # —— 关键：强制 Standard 视图变换，避免 Filmic 变灰 —— #
+            cm.view_transform = 'Standard'
+            cm.look = 'None'
+            cm.exposure = 0.0
+            cm.gamma = 1.0
+
+            # 世界背景设为纯黑 + 不透明背景
+            scene.render.film_transparent = False
+            if world:
+                if world.use_nodes and world.node_tree and bg_node:
+                    if "Color" in bg_node.inputs:
+                        bg_node.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+                    if "Strength" in bg_node.inputs:
+                        bg_node.inputs["Strength"].default_value = 1.0
+                elif not world.use_nodes:
+                    world.color = (0.0, 0.0, 0.0)
+
+            # 材质覆盖 + 灰度 8bit 输出
             view_layer.material_override = mat
-            scene.render.film_transparent = True
             scene.render.filepath = out_path_noext
             img.file_format = 'PNG'
-            img.color_mode = 'RGBA'
+            img.color_mode = 'BW'     # 直接灰度输出
             img.color_depth = '8'
 
             bpy.ops.render.render(write_still=True)
@@ -469,26 +504,40 @@ class PSB_OT_RenderCameraMask(bpy.types.Operator):
                 out_path += ".png"
 
         finally:
-            # 还原现场
+            # —— 还原现场 —— #
             for obj, hv in orig_hide_map.items():
                 try: obj.hide_render = hv
                 except: pass
             view_layer.material_override = orig_override
+
+            if world:
+                if world and orig_world_use_nodes and world.node_tree and bg_node:
+                    if orig_bg_col is not None and "Color" in bg_node.inputs:
+                        bg_node.inputs["Color"].default_value = orig_bg_col
+                    if orig_bg_strength is not None and "Strength" in bg_node.inputs:
+                        bg_node.inputs["Strength"].default_value = orig_bg_strength
+                elif world and not orig_world_use_nodes and orig_world_color is not None:
+                    world.color = orig_world_color
+
             scene.render.film_transparent = orig_film
             scene.render.filepath = orig_filepath
             img.file_format = orig_format
             img.color_mode = orig_color_mode
             img.color_depth = orig_color_depth
+
+            cm.view_transform = orig_view_transform
+            cm.look = orig_look
+            cm.exposure = orig_exposure
+            cm.gamma = orig_gamma
+
             scene.render.engine = orig_engine
             scene.camera = orig_cam
             try: bpy.data.materials.remove(mat, do_unlink=True)
             except: pass
 
-        try: props.mask_path = out_path
-        except: pass
-
         self.report({'INFO'}, f"已导出遮罩：{out_path}")
         return {'FINISHED'}
+
 
 
 class PSB_OT_RenderCameraStill(bpy.types.Operator):
