@@ -161,145 +161,193 @@ class PSB_OT_Export(bpy.types.Operator):
 
     def execute(self, context):
         props = context.scene.psb_exporter
-        cam    = props.camera
-        obj    = props.target_object
+        mode_render = props.render_mode  # "CAMERA" or "VIEWPORT"
         out_dir = bpy.path.abspath(props.out_dir)
-        uv_size = props.uv_size
-        mode    = props.render_mode  # "CAMERA" or "VIEWPORT"
+        uv_size = int(props.uv_size)
 
-        # ---------- 校验 ----------
-        if not obj or obj.type != 'MESH':
-            self.report({'ERROR'}, "请选择一个网格物体")
+        # -------- 收集目标 --------
+        targets = []
+        if getattr(props, "bake_target_mode", "SINGLE") == "COLLECTION":
+            col = getattr(props, "target_collection", None)
+            if col:
+                targets = [o for o in col.objects if getattr(o, "type", "") == 'MESH']
+        else:
+            obj = getattr(props, "target_object", None)
+            if obj and getattr(obj, "type", "") == 'MESH':
+                targets = [obj]
+
+        if not targets:
+            self.report({'ERROR'}, "未找到要导出的网格物体（请检查目标类型与目标选择）")
             return {'CANCELLED'}
-        if mode == "CAMERA" and (not cam or cam.type != 'CAMERA'):
+
+        # -------- 相机/视口前置检查 --------
+        cam = props.camera
+        if mode_render == "CAMERA" and (not cam or cam.type != 'CAMERA'):
             self.report({'ERROR'}, "渲染源为相机，但未选择有效相机")
             return {'CANCELLED'}
 
         ensure_dir(out_dir)
-        base = f"{obj.name}_{timestamp()}"
 
-        # ---------- 1) 渲染 / 抓图 ----------
+        # -------- 命名基准 --------
+        # 相机名：相机模式用 cam.name；视口模式用 "Viewport"
+        camera_name = cam.name if (mode_render == "CAMERA" and cam) else "Viewport"
+
+        # Blender 文件名（用于 metadata.json）
+        blend_path = bpy.data.filepath
+        blend_base = os.path.splitext(os.path.basename(blend_path))[0] if blend_path else "untitled"
+
+        # -------- 渲染一次：相机名_camera.png --------
         try:
-            if mode == "CAMERA":
-                image_path = render_from_camera(context.scene, cam, out_dir, base)
+            if mode_render == "CAMERA":
+                # render_from_camera 会生成 <basename>_camera.png，因此 basename 直接用 camera_name
+                image_path_tmp = render_from_camera(context.scene, cam, out_dir, camera_name)
+                image_path = image_path_tmp  # 已经是 .../<相机名>_camera.png
             else:
-                image_path = render_from_viewport(
-                    context, out_dir, base,
-                    props.viewport_width, props.viewport_height
+                # 视口函数会生成 <basename>_viewport.png；我们强制改名成 <相机名>_camera.png
+                image_path_tmp = render_from_viewport(
+                    context, out_dir, camera_name, int(props.viewport_width), int(props.viewport_height)
                 )
+                image_path = os.path.join(out_dir, f"{camera_name}_camera.png")
+                try:
+                    if os.path.abspath(image_path_tmp) != os.path.abspath(image_path):
+                        if os.path.exists(image_path):
+                            os.remove(image_path)
+                        os.replace(image_path_tmp, image_path)
+                except Exception:
+                    # 如果改名失败，就用原始路径，但后续仍按 image_path 记录
+                    image_path = image_path_tmp
         except Exception as e:
             self.report({'ERROR'}, f"渲染失败：{e}")
             return {'CANCELLED'}
 
-        # ---------- 2) 相机参数（可选：即使是 VIEWPORT 模式，只要选了相机就导出） ----------
-        K = cam_params = cam_to_world = world_to_cam = R = t = proj = None
-        if cam and cam.type == 'CAMERA':
-            try:
-                K, cam_params = compute_camera_K(context.scene, cam)             # PERSP/ORTHO 返回 3x3；PANO 返回 None
-                cam_to_world, world_to_cam, R, t = get_extrinsics(cam)           # X_cam = R * X_world + t
-                proj = compute_projection_matrix_gl(context.scene, cam)          # OpenGL 风格 4x4；PANO 为 None
-            except Exception as e:
-                self.report({'WARNING'}, f"相机参数计算失败：{e}")
-
-        # ---------- 2b) 视口“相机”标定（总是尝试写，便于外部对齐） ----------
-        viewport_calib = None
-        try:
-            if mode == "VIEWPORT":
-                vp_w = int(props.viewport_width)
-                vp_h = int(props.viewport_height)
-            else:
-                # 相机模式下，沿用场景当前渲染尺寸
-                vp_w = int(context.scene.render.resolution_x * (context.scene.render.resolution_percentage / 100.0))
-                vp_h = int(context.scene.render.resolution_y * (context.scene.render.resolution_percentage / 100.0))
-            viewport_calib = compute_viewport_calibration(context, vp_w, vp_h)
-        except Exception as e:
-            # 没有 3D 视口或其它异常
-            viewport_calib = None
-
-        # ---------- 3) UV 数据 + UV 轮廓 PNG ----------
-        try:
-            uv_data = collect_object_uv_data(obj)
-            uv_png  = export_uv_layout_png(obj, out_dir, base, size=uv_size)
-        except Exception as e:
-            self.report({'ERROR'}, f"导出 UV 失败：{e}")
-            return {'CANCELLED'}
-
-        # ---------- 4) 物体信息 ----------
-        bbox_world = [vec3_to_list(obj.matrix_world @ Vector(corner)) for corner in obj.bound_box]
-        obj_info = {
-            "name": obj.name,
-            "matrix_world": mat4_to_list(obj.matrix_world),
-            "bbox_world": bbox_world,
-            "data_name": obj.data.name,
-        }
-
-        # ---------- 5) 写 metadata ----------
-        meta = {
-            "export_time": timestamp(),
-            "render_source": mode,  # "CAMERA" / "VIEWPORT"
-
-            "image_path":    os.path.relpath(image_path, out_dir) if image_path.startswith(out_dir) else image_path,
-            "uv_layout_path":os.path.relpath(uv_png,   out_dir) if uv_png.startswith(out_dir)   else uv_png,
-
-            "object":  obj_info,
-            "uv_data": uv_data,
-
-            # 视口“相机”参数（总是尝试写）
-            "viewport_params": {
-                "width":  props.viewport_width  if mode == "VIEWPORT" else None,
-                "height": props.viewport_height if mode == "VIEWPORT" else None,
-            },
-            "viewport_intrinsics_K":            (viewport_calib["intrinsics_K"]            if viewport_calib else None),
-            "viewport_projection_matrix_4x4":   (viewport_calib["projection_matrix_4x4"]   if viewport_calib else None),
-            "viewport_world_to_view":           (viewport_calib["world_to_view"]           if viewport_calib else None),
-            "viewport_view_to_world":           (viewport_calib["view_to_world"]           if viewport_calib else None),
-            "viewport_R_world_to_view":         (viewport_calib["R_world_to_view"]         if viewport_calib else None),
-            "viewport_t_world_to_view":         (viewport_calib["t_world_to_view"]         if viewport_calib else None),
-            "viewport_view_perspective":        (viewport_calib["view_perspective"]        if viewport_calib else None),
-            "viewport_lens_mm":                 (viewport_calib["lens_mm"]                 if viewport_calib else None),
-
-            # 相机（若选择了相机）
-            "camera_object":        (cam.name if cam else None),
-            "camera_params":        cam_params,                             # 分辨率、传感器、镜头等
-            "camera_intrinsics_K":  K,                                       # PERSP/ORTHO 为 3x3；PANO 为 None
-            "camera_to_world":      (mat4_to_list(cam_to_world) if cam_to_world else None),
-            "world_to_camera":      (mat4_to_list(world_to_cam) if world_to_cam else None),
-            "R_world_to_cam":       (mat3_to_list(R) if R else None),
-            "t_world_to_cam":       (vec3_to_list(t) if t else None),
-            "projection_matrix_4x4":proj,                                    # OpenGL 风格 4x4；PANO 为 None
-        }
-
-        meta_path = os.path.join(out_dir, f"{base}_metadata.json")
-        try:
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=2)
-
-                # 在成功写入 meta_path 后追加：
-                props.meta_path = bpy.path.relpath(meta_path)
-                
-        except Exception as e:
-            self.report({'ERROR'}, f"写入 metadata 失败：{e}")
-            return {'CANCELLED'}
-
-
-
-        # ---------- 6) 生成两张空白图片 ----------
-        # 尺寸：UV
-        uv_canvas_path = os.path.join(out_dir, f"{obj.name}_paint_uv.png")
-        create_blank_png(uv_size, uv_size, uv_canvas_path)
-        props.paint_uv_path = bpy.path.relpath(uv_canvas_path)
-
-        # 尺寸：渲染输出
-        if mode == "VIEWPORT":
+        # -------- 计算 3D 画布尺寸并生成：相机名_paint_3d.png --------
+        if mode_render == "VIEWPORT":
             rw, rh = int(props.viewport_width), int(props.viewport_height)
         else:
             s = context.scene
             rw = int(s.render.resolution_x * (s.render.resolution_percentage / 100.0))
             rh = int(s.render.resolution_y * (s.render.resolution_percentage / 100.0))
-        paint3d_path = os.path.join(out_dir, f"{obj.name}_paint_3d.png")
-        create_blank_png(rw, rh, paint3d_path)
-        props.paint_3d_path = bpy.path.relpath(paint3d_path)
 
+        paint3d_path = os.path.join(out_dir, f"{camera_name}_paint_3d.png")
+        # 使用烘焙背景色作为初始颜色
+        bg = tuple(getattr(props, "bake_background_color", (1.0, 1.0, 1.0, 0.0)))
+        create_blank_png(rw, rh, paint3d_path, color=bg)
 
-        self.report({'INFO'}, f"导出完成：{out_dir}")
+        # -------- 相机参数（若有） --------
+        K = cam_params = cam_to_world = world_to_cam = R = t = proj = None
+        if cam and cam.type == 'CAMERA':
+            try:
+                K, cam_params = compute_camera_K(context.scene, cam)
+                cam_to_world, world_to_cam, R, t = get_extrinsics(cam)
+                proj = compute_projection_matrix_gl(context.scene, cam)
+            except Exception as e:
+                self.report({'WARNING'}, f"相机参数计算失败：{e}")
+
+        # -------- 视口标定（尽量写） --------
+        viewport_calib = None
+        try:
+            if mode_render == "VIEWPORT":
+                vp_w = int(props.viewport_width)
+                vp_h = int(props.viewport_height)
+            else:
+                s = context.scene
+                vp_w = int(s.render.resolution_x * (s.render.resolution_percentage / 100.0))
+                vp_h = int(s.render.resolution_y * (s.render.resolution_percentage / 100.0))
+            viewport_calib = compute_viewport_calibration(context, vp_w, vp_h)
+        except Exception:
+            viewport_calib = None
+
+        # -------- 为每个物体生成：物体名_paint_uv.png --------
+        per_object_entries = []
+        first_uv_canvas_abs = ""
+        for obj in targets:
+            try:
+                uv_canvas_path = os.path.join(out_dir, f"{obj.name}_paint_uv.png")
+                create_blank_png(uv_size, uv_size, uv_canvas_path)
+
+                # UV 数据（用于写入 metadata）
+                uv_data = collect_object_uv_data(obj)
+
+                # 物体信息
+                from mathutils import Vector
+                bbox_world = [vec3_to_list(obj.matrix_world @ Vector(corner)) for corner in obj.bound_box]
+                obj_info = {
+                    "name": obj.name,
+                    "matrix_world": mat4_to_list(obj.matrix_world),
+                    "bbox_world": bbox_world,
+                    "data_name": obj.data.name,
+                    "paint_uv_path": uv_canvas_path,   # 绝对路径
+                    "uv_data": uv_data,                # 直接存数组（如需体积可删掉）
+                }
+                per_object_entries.append(obj_info)
+
+                if not first_uv_canvas_abs:
+                    first_uv_canvas_abs = uv_canvas_path
+            except Exception as e:
+                self.report({'WARNING'}, f"{obj.name} 生成 UV 画布失败：{e}")
+                continue
+
+        if not per_object_entries:
+            self.report({'ERROR'}, "未能为任何对象生成 UV 画布")
+            return {'CANCELLED'}
+
+        # -------- 写单一 metadata：Blender文件名_metadata.json --------
+        meta = {
+            "export_time": timestamp(),
+            "render_source": mode_render,     # "CAMERA"/"VIEWPORT"
+            "camera_name": camera_name,
+
+            # 导出的一次性资源
+            "image_path": image_path,         # 相机名_camera.png（绝对路径）
+            "paint3d_path": paint3d_path,     # 相机名_paint_3d.png（绝对路径）
+
+            # 目标对象列表
+            "objects": per_object_entries,
+
+            # 视口“相机”参数（尽量写，缺失则 None）
+            "viewport_params": {
+                "width":  int(props.viewport_width)  if mode_render == "VIEWPORT" else None,
+                "height": int(props.viewport_height) if mode_render == "VIEWPORT" else None,
+            },
+            "viewport_intrinsics_K":          (viewport_calib["intrinsics_K"]          if viewport_calib else None),
+            "viewport_projection_matrix_4x4": (viewport_calib["projection_matrix_4x4"] if viewport_calib else None),
+            "viewport_world_to_view":         (viewport_calib["world_to_view"]         if viewport_calib else None),
+            "viewport_view_to_world":         (viewport_calib["view_to_world"]         if viewport_calib else None),
+            "viewport_R_world_to_view":       (viewport_calib["R_world_to_view"]       if viewport_calib else None),
+            "viewport_t_world_to_view":       (viewport_calib["t_world_to_view"]       if viewport_calib else None),
+            "viewport_view_perspective":      (viewport_calib["view_perspective"]      if viewport_calib else None),
+            "viewport_lens_mm":               (viewport_calib["lens_mm"]               if viewport_calib else None),
+
+            # 相机（若选择了相机）
+            "camera_object":        (cam.name if cam else None),
+            "camera_params":        cam_params,
+            "camera_intrinsics_K":  K,
+            "camera_to_world":      (mat4_to_list(cam_to_world) if cam_to_world else None),
+            "world_to_camera":      (mat4_to_list(world_to_cam) if world_to_cam else None),
+            "R_world_to_cam":       (mat3_to_list(R) if R else None),
+            "t_world_to_cam":       (vec3_to_list(t) if t else None),
+            "projection_matrix_4x4":proj,
+        }
+
+        meta_path = os.path.join(out_dir, f"{blend_base}_metadata.json")
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.report({'ERROR'}, f"写入 metadata 失败：{e}")
+            return {'CANCELLED'}
+
+        # -------- 把 3 个关键路径写回到面板（绝对路径） --------
+        try:
+            props.meta_path = os.path.abspath(meta_path)
+        except: pass
+        try:
+            props.paint_3d_path = os.path.abspath(paint3d_path)
+        except: pass
+        # UV 画布有多张，这里写回第一张，便于 UI 快速预览/修改
+        if first_uv_canvas_abs:
+            try: props.paint_uv_path = os.path.abspath(first_uv_canvas_abs)
+            except: pass
+
+        self.report({'INFO'}, f"导出完成：图像与 3D 画布基于“{camera_name}”，{len(per_object_entries)} 个 UV 画布，元数据：{blend_base}_metadata.json")
         return {'FINISHED'}

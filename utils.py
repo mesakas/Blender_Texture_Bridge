@@ -2,7 +2,8 @@
 import os
 import time
 from mathutils import Matrix, Vector
-
+import shutil
+import bpy
 
 # utils.py 末尾附近新增
 
@@ -353,3 +354,89 @@ def compute_viewport_calibration(context, width, height):
         "lens_mm": getattr(space, "lens", None),
     }
     return data
+
+
+
+
+def to_abs(path: str) -> str:
+    """统一转绝对路径（兼容 Windows），规整 //、\\、/ 混用问题。"""
+    import bpy, os
+    if not path:
+        return ""
+    p = bpy.path.abspath(path)
+    try:
+        p = os.path.normpath(os.path.abspath(p))
+    except Exception:
+        pass
+    return p
+
+def make_outpath(base_dir: str, category: str, name: str, ext: str) -> str:
+    """
+    统一命名：分类_名称_时间戳.后缀，并返回绝对路径。
+    """
+    import os
+    ensure_dir(base_dir)
+    from .utils import timestamp  # 若本文件内已有就可省略此行
+    fname = f"{category}_{name}_{timestamp()}.{ext.lstrip('.')}"
+    return to_abs(os.path.join(base_dir, fname))
+
+def copy_backup(src_path: str, backup_dir: str, category: str, name: str):
+    """把旧贴图备份到 backup_dir 下，使用统一命名。"""
+    import os, shutil
+    if not src_path or not os.path.exists(src_path):
+        return None
+    ensure_dir(backup_dir)
+    ext = os.path.splitext(src_path)[1].lstrip('.').lower() or "png"
+    dst = make_outpath(backup_dir, category, name, ext)
+    shutil.copy2(src_path, dst)
+    return dst
+
+def alpha_over(dst_img, top_img):
+    """
+    将 top_img 以其 alpha 覆盖到 dst_img（必须同宽高）。
+    out.rgb = top.rgb * top.a + dst.rgb * (1-top.a)；out.a = max(dst.a, top.a)
+    """
+    if int(dst_img.size[0]) != int(top_img.size[0]) or int(dst_img.size[1]) != int(top_img.size[1]):
+        raise RuntimeError("叠加失败：两张图片尺寸不一致。")
+
+    dpx = list(dst_img.pixels[:])
+    tpx = list(top_img.pixels[:])
+    total = int(dst_img.size[0] * dst_img.size[1])
+
+    for i in range(total):
+        j = i * 4
+        tr, tg, tb, ta = tpx[j:j+4]
+        dr, dg, db, da = dpx[j:j+4]
+        inv = (1.0 - ta)
+        dpx[j+0] = tr * ta + dr * inv
+        dpx[j+1] = tg * ta + dg * inv
+        dpx[j+2] = tb * ta + db * inv
+        dpx[j+3] = max(da, ta)
+
+    dst_img.pixels[:] = dpx
+    dst_img.update()
+
+    """
+    将 top_img 以其 alpha 覆盖到 dst_img（必须同宽高）。
+    注意：不做重采样；若尺寸不同，调用者应做尺寸一致的保障或放弃叠加。
+    """
+    if int(dst_img.size[0]) != int(top_img.size[0]) or int(dst_img.size[1]) != int(top_img.size[1]):
+        raise RuntimeError("叠加失败：两张图片尺寸不一致。")
+
+    # 取像素并 alpha 叠加：out = top.rgb * top.a + dst.rgb * (1 - top.a)，alpha 合并保留 max
+    dpx = list(dst_img.pixels[:])
+    tpx = list(top_img.pixels[:])
+    total = int(dst_img.size[0] * dst_img.size[1])
+
+    for i in range(total):
+        j = i * 4
+        tr, tg, tb, ta = tpx[j:j+4]
+        dr, dg, db, da = dpx[j:j+4]
+        inv = (1.0 - ta)
+        dpx[j+0] = tr * ta + dr * inv
+        dpx[j+1] = tg * ta + dg * inv
+        dpx[j+2] = tb * ta + db * inv
+        dpx[j+3] = max(da, ta)
+
+    dst_img.pixels[:] = dpx
+    dst_img.update()

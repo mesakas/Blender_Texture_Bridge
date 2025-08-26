@@ -42,7 +42,7 @@ class PSB_ExporterProps(bpy.types.PropertyGroup):
     )
 
     meta_path: bpy.props.StringProperty(
-        name="Metadata JSON 路径",
+        name="Metadata JSON",
         subtype='FILE_PATH',
         default=""
     )
@@ -91,15 +91,50 @@ class PSB_ExporterProps(bpy.types.PropertyGroup):
         name="烘焙输出路径", subtype='FILE_PATH', default=""
     )
 
-    # ====== 3D 烘焙结果中的“未绘制/不可见”背景颜色（含透明度） ======
+    # --- 烘焙输出根目录（默认 out_dir/baked） ---
+    bake_dir: bpy.props.StringProperty(
+        name="烘焙输出目录",
+        description="3D 烘焙、深度EXR与日志的输出目录；为空时自动使用 输出目录/out_dir/baked",
+        subtype='DIR_PATH',
+        default=""
+    )
+
+    # --- 叠加与备份 ---
+    overlay_enabled: bpy.props.BoolProperty(
+        name="叠加到现有贴图",
+        description="将新绘制叠加到当前材质的贴图上（Alpha覆盖）；尺寸需一致，否则改为直接替换",
+        default=False
+    )
+    backup_enabled: bpy.props.BoolProperty(
+        name="备份旧贴图",
+        description="在覆盖/叠加前，把旧贴图备份到 out_dir/backup_texture 中",
+        default=True
+    )
+
+
+    # ===== 两个独立 GPU 开关 =====
+    use_gpu_depth: bpy.props.BoolProperty(
+        name="深度/遮罩渲染用 GPU（Cycles）",
+        description="用于渲染深度图/可见性遮罩",
+        default=True,
+    )
+    use_gpu_bake: bpy.props.BoolProperty(
+        name="烘焙贴图用 GPU（Cycles）",
+        description="用于烘焙贴图（EMIT）",
+        default=True,
+    )
+
+
+    # —— 烘焙背景（放在烘焙按钮前面的那一组里）——
     bake_background_color: bpy.props.FloatVectorProperty(
         name="烘焙背景（RGBA）",
-        description="ApplyPaint3D 的未投射区域将写入此颜色与透明度",
+        description="ApplyPaint3D 中未被投射/不可见的像素将使用此颜色与透明度",
         subtype='COLOR',
         size=4,
         min=0.0, max=1.0,
-        default=(1.0, 1.0, 1.0, 0.0)  # 默认：白+完全透明
+        default=(1.0, 1.0, 1.0, 0.0)
     )
+
 
     # ====== 可见性/遮挡 控制参数（新增） ======
     mask_visible_color: bpy.props.FloatVectorProperty(

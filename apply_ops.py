@@ -11,6 +11,8 @@ from .utils import (
     get_active_uv_image_size,
     compute_viewport_calibration,
     pick_bake_targets,
+    to_abs, make_outpath, copy_backup, alpha_over, 
+    timestamp,
 )
 
 
@@ -47,9 +49,6 @@ def _enable_cycles_gpu(scene):
 
     if not ok:
         scene.cycles.device = 'CPU'
-
-
-
 
 def _render_depth_map(context, cam_obj, width, height, out_path, enable_gpu=False):
     """
@@ -162,8 +161,6 @@ def _render_depth_map(context, cam_obj, width, height, out_path, enable_gpu=Fals
 
     return saved
 
-
-
 def _make_frontfacing_vgroup(obj, cam_obj, name="PSB_FrontFacing", threshold_deg=0.0):
     """
     创建/覆盖一个临时顶点组：只包含“朝向相机”的面（按阈值）的顶点。
@@ -198,8 +195,6 @@ def _make_frontfacing_vgroup(obj, cam_obj, name="PSB_FrontFacing", threshold_deg
                 vg.add([vi], 1.0, 'REPLACE')
 
     return vg.name
-
-
 
 # —— 从 JSON 建立相机：完全按导出参数还原 —— #
 def _camera_from_json(context, meta: dict, paint_w: int, paint_h: int):
@@ -285,7 +280,6 @@ def _camera_from_json(context, meta: dict, paint_w: int, paint_h: int):
 
     raise RuntimeError("元数据中缺少可用于重建相机/视口的参数（需要 camera_* 或 viewport_*）。")
 
-
 # —— 用 JSON 相机做烘焙 —— #
 class PSB_OT_ApplyPaint3D(bpy.types.Operator):
     bl_idname = "psb.apply_paint3d"
@@ -303,8 +297,16 @@ class PSB_OT_ApplyPaint3D(bpy.types.Operator):
         if not p.paint_3d_path:
             self.report({'ERROR'}, "未设置 3D 绘制图片路径"); return {'CANCELLED'}
 
-        # 读取 JSON
-        meta_path = bpy.path.abspath(p.meta_path)
+        # === 路径与开关 ===
+        out_dir  = to_abs(p.out_dir) if p.out_dir else os.getcwd()
+        bake_dir = to_abs(getattr(p, "bake_dir", "")) if getattr(p, "bake_dir", "") else os.path.join(out_dir, "baked")
+        ensure_dir(bake_dir)
+
+        use_gpu_depth = bool(getattr(p, "use_gpu_depth", getattr(p, "use_gpu", False)))
+        use_gpu_bake  = bool(getattr(p, "use_gpu_bake",  getattr(p, "use_gpu", False)))
+
+        # === 读取 JSON ===
+        meta_path = to_abs(p.meta_path)
         if not meta_path or not os.path.exists(meta_path):
             self.report({'ERROR'}, "未找到 metadata JSON，请在面板指定"); return {'CANCELLED'}
         try:
@@ -313,8 +315,8 @@ class PSB_OT_ApplyPaint3D(bpy.types.Operator):
         except Exception as e:
             self.report({'ERROR'}, f"读取 JSON 失败：{e}"); return {'CANCELLED'}
 
-        # 源图
-        src_path = bpy.path.abspath(p.paint_3d_path)
+        # === 源图 ===
+        src_path = to_abs(p.paint_3d_path)
         if not src_path or not os.path.exists(src_path):
             self.report({'ERROR'}, f"找不到 3D 绘制图片：{src_path}"); return {'CANCELLED'}
         img_src = load_image_from_path(src_path)
@@ -330,20 +332,20 @@ class PSB_OT_ApplyPaint3D(bpy.types.Operator):
         except: pass
         paint_w, paint_h = int(img_src.size[0]), int(img_src.size[1])
 
-        # 相机
+        # === 相机重建 ===
         try:
             cam_obj, cam_data, used = _camera_from_json(context, meta, paint_w, paint_h)
         except Exception as e:
             self.report({'ERROR'}, f"重建相机失败：{e}"); return {'CANCELLED'}
 
-        # 如果勾选GPU，先切到GPU
-        if getattr(p, "use_gpu", False):
+        # === 深度 EXR（一次） ===
+        if use_gpu_depth:
             _enable_cycles_gpu(context.scene)
 
-        # 深度
-        out_dir = bpy.path.abspath(p.out_dir); ensure_dir(out_dir)
-        depth_exr_path = os.path.join(out_dir, f"__psb_cam_depth_once__.exr")
-        saved_depth = _render_depth_map(context, cam_obj, paint_w, paint_h, depth_exr_path, enable_gpu=getattr(p, "use_gpu", False))
+        depth_exr_path = make_outpath(bake_dir, "depth", targets[0].name, "exr")
+        saved_depth = _render_depth_map(
+            context, cam_obj, paint_w, paint_h, depth_exr_path, enable_gpu=use_gpu_depth
+        )
         depth_img = load_image_from_path(saved_depth)
         if not depth_img:
             self.report({'ERROR'}, "深度图渲染失败"); return {'CANCELLED'}
@@ -359,6 +361,11 @@ class PSB_OT_ApplyPaint3D(bpy.types.Operator):
 
         baked_count = 0
         last_baked_path = ""
+        log_lines = []
+        log_lines.append(f"ApplyPaint3D session @ {timestamp()}")
+        log_lines.append(f"meta: {meta_path}")
+        log_lines.append(f"paint3d: {src_path}")
+        log_lines.append(f"depth_exr: {saved_depth}")
 
         try:
             for obj in targets:
@@ -503,7 +510,7 @@ class PSB_OT_ApplyPaint3D(bpy.types.Operator):
                 orig_engine = scene.render.engine
                 try:
                     scene.render.engine = 'CYCLES'
-                    if getattr(p, "use_gpu", False):
+                    if use_gpu_bake:
                         _enable_cycles_gpu(scene)
 
                     bpy.ops.object.select_all(action='DESELECT')
@@ -539,8 +546,8 @@ class PSB_OT_ApplyPaint3D(bpy.types.Operator):
                         col_buf[mi+3] = m + (1.0 - m) * bg_a
                     target_img.pixels[:] = col_buf
 
-                    # 保存
-                    baked_path = os.path.join(out_dir, f"{obj.name}_baked.png")
+                    # 保存（统一命名到 bake_dir）
+                    baked_path = make_outpath(bake_dir, "baked", obj.name, "png")
                     try:
                         target_img.alpha_mode = 'STRAIGHT'
                         target_img.use_alpha = True
@@ -552,6 +559,7 @@ class PSB_OT_ApplyPaint3D(bpy.types.Operator):
                     target_img.save()
                     last_baked_path = baked_path
                     baked_count += 1
+                    log_lines.append(f"baked: {baked_path}")
 
                     # 清理临时 mask
                     try: nt.nodes.remove(mask_node)
@@ -580,11 +588,18 @@ class PSB_OT_ApplyPaint3D(bpy.types.Operator):
                 except: pass
 
         if last_baked_path:
-            p.baked_path = bpy.path.relpath(last_baked_path)
+            p.baked_path = last_baked_path  # 绝对路径
+
+        # 写日志（到 bake_dir）
+        try:
+            log_path = make_outpath(bake_dir, "log", targets[0].name, "txt")
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(log_lines) + "\n")
+        except Exception:
+            pass
 
         self.report({'INFO'}, f"按 JSON 投影并烘焙完成：{baked_count} 个对象（模式：{used}）")
         return {'FINISHED'}
-
 
 def _make_temp_projector_camera(context, mode: str, camera_obj, vp_calib, width:int, height:int):
     """
@@ -749,12 +764,14 @@ class PSB_OT_CreateBlankCanvases(bpy.types.Operator):
 
     def execute(self, context):
         p = context.scene.psb_exporter
-        out_dir = bpy.path.abspath(p.out_dir)
+        out_dir = to_abs(p.out_dir) if p.out_dir else os.getcwd()
         ensure_dir(out_dir)
 
-        # UV 画布
-        uv_path = os.path.join(out_dir, f"{p.target_object.name}_paint_uv.png")
-        create_blank_png(p.uv_size, p.uv_size, uv_path)
+        obj_name = p.target_object.name if getattr(p, "target_object", None) else "object"
+
+        # UV 画布：统一命名
+        uv_path = make_outpath(out_dir, "uvcanvas", obj_name, "png")
+        create_blank_png(int(p.uv_size), int(p.uv_size), uv_path)
 
         # 3D 画布尺寸：来自视口或相机的导出尺寸
         if p.render_mode == "VIEWPORT":
@@ -763,15 +780,17 @@ class PSB_OT_CreateBlankCanvases(bpy.types.Operator):
             s = context.scene
             w = int(s.render.resolution_x * (s.render.resolution_percentage / 100.0))
             h = int(s.render.resolution_y * (s.render.resolution_percentage / 100.0))
-        paint3d_path = os.path.join(out_dir, f"{p.target_object.name}_paint_3d.png")
-        # create_blank_png(w, h, paint3d_path)
-        create_blank_png(w, h, paint3d_path, color=tuple(context.scene.psb_exporter.bake_background_color))
 
+        paint3d_path = make_outpath(out_dir, "paint3d", obj_name, "png")
+        # 使用“烘焙背景”颜色作为空白 3D 画布底色
+        bg = tuple(getattr(p, "bake_background_color", (1.0, 1.0, 1.0, 0.0)))
+        create_blank_png(w, h, paint3d_path, color=bg)
 
-        p.paint_uv_path = bpy.path.relpath(uv_path)
-        p.paint_3d_path = bpy.path.relpath(paint3d_path)
+        # 回写绝对路径
+        p.paint_uv_path = uv_path
+        p.paint_3d_path = paint3d_path
 
-        self.report({'INFO'}, "已生成空白画布")
+        self.report({'INFO'}, "已生成空白画布（绝对路径已写回）")
         return {'FINISHED'}
 
 
@@ -789,14 +808,58 @@ class PSB_OT_ApplyPaintUV(bpy.types.Operator):
         if not p.paint_uv_path:
             self.report({'ERROR'}, "未设置 UV 绘制图片路径"); return {'CANCELLED'}
 
-        img = load_image_from_path(bpy.path.abspath(p.paint_uv_path))
-        if not img:
+        uv_img_path = to_abs(p.paint_uv_path)
+        img_new = load_image_from_path(uv_img_path)
+        if not img_new:
             self.report({'ERROR'}, "无法加载 UV 绘制图片"); return {'CANCELLED'}
 
-        for obj in targets:
-            assign_image_to_basecolor(obj, img)
+        overlay = bool(getattr(p, "overlay_enabled", False))
+        backup  = bool(getattr(p, "backup_enabled", False))
+        out_dir = to_abs(p.out_dir) if p.out_dir else os.getcwd()
 
-        self.report({'INFO'}, f"已将 UV 绘制图片绑定到 {len(targets)} 个物体的材质")
+        for obj in targets:
+            # 没有材质或节点，直接绑定
+            if not obj.data.materials:
+                assign_image_to_basecolor(obj, img_new); continue
+            mat = obj.data.materials[0]
+            if not mat or not mat.use_nodes:
+                assign_image_to_basecolor(obj, img_new); continue
+
+            nt = mat.node_tree
+            bsdf = None
+            for n in nt.nodes:
+                if n.type == 'BSDF_PRINCIPLED':
+                    bsdf = n; break
+
+            cur_tex = None
+            if bsdf:
+                for l in nt.links:
+                    if l.to_node == bsdf and l.to_socket.name == "Base Color" and l.from_node.type == 'TEX_IMAGE':
+                        cur_tex = l.from_node
+                        break
+
+            if not overlay or not cur_tex or not cur_tex.image or not cur_tex.image.filepath_raw:
+                # 直接替换
+                assign_image_to_basecolor(obj, img_new)
+                continue
+
+            # 叠加：备份 -> alpha_over -> 保存回原路径
+            dst_img = cur_tex.image
+            try:
+                if backup:
+                    backup_dir = os.path.join(out_dir, "backup_texture")
+                    copy_backup(to_abs(dst_img.filepath_raw), backup_dir, "texture", obj.name)
+            except Exception as e:
+                self.report({'WARNING'}, f"备份旧贴图失败：{obj.name}：{e}")
+
+            try:
+                alpha_over(dst_img, img_new)  # 尺寸不一致会抛异常
+                dst_img.save()
+            except Exception as e:
+                assign_image_to_basecolor(obj, img_new)
+                self.report({'WARNING'}, f"叠加失败（已改为替换）：{obj.name}：{e}")
+
+        self.report({'INFO'}, f"已应用到 {len(targets)} 个物体（叠加={overlay}）")
         return {'FINISHED'}
 
 
@@ -806,7 +869,7 @@ class PSB_OT_BakeVisibilityMask(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        import math
+        import math, os
         p = context.scene.psb_exporter
         targets = pick_bake_targets(p)
         if not targets:
@@ -814,7 +877,7 @@ class PSB_OT_BakeVisibilityMask(bpy.types.Operator):
             return {'CANCELLED'}
 
         # 读取 JSON
-        meta_path = bpy.path.abspath(p.meta_path)
+        meta_path = to_abs(p.meta_path)
         if not meta_path or not os.path.exists(meta_path):
             self.report({'ERROR'}, "未找到 metadata JSON，请在面板指定"); return {'CANCELLED'}
         try:
@@ -823,9 +886,11 @@ class PSB_OT_BakeVisibilityMask(bpy.types.Operator):
         except Exception as e:
             self.report({'ERROR'}, f"读取 JSON 失败：{e}"); return {'CANCELLED'}
 
-        out_dir = bpy.path.abspath(p.out_dir); ensure_dir(out_dir)
+        out_dir  = to_abs(p.out_dir) if p.out_dir else os.getcwd()
+        bake_dir = to_abs(getattr(p, "bake_dir", "")) if getattr(p, "bake_dir", "") else os.path.join(out_dir, "baked")
+        ensure_dir(bake_dir)
 
-        # 用 meta 中视口尺寸或回退 uv_size 作为深度图尺寸（一次）
+        # 尺寸（一次）
         paint_w = int(meta.get("viewport_params",{}).get("width")  or p.uv_size)
         paint_h = int(meta.get("viewport_params",{}).get("height") or p.uv_size)
 
@@ -835,9 +900,17 @@ class PSB_OT_BakeVisibilityMask(bpy.types.Operator):
         except Exception as e:
             self.report({'ERROR'}, f"重建相机失败：{e}"); return {'CANCELLED'}
 
-        # 深度（一次渲染）
-        depth_exr_path = os.path.join(out_dir, f"__psb_cam_depth_once__.exr")
-        saved_depth = _render_depth_map(context, cam_obj, paint_w, paint_h, depth_exr_path)
+        # 深度（一次渲染到 bake_dir）
+        use_gpu_depth = bool(getattr(p, "use_gpu_depth", getattr(p, "use_gpu", False)))
+        if use_gpu_depth:
+            _enable_cycles_gpu(context.scene)
+
+        depth_exr_path = make_outpath(bake_dir, "depth", targets[0].name, "exr")
+        saved_depth = _render_depth_map(
+            context, cam_obj, paint_w, paint_h, depth_exr_path,
+            enable_gpu=use_gpu_depth
+        )
+
         depth_img = load_image_from_path(saved_depth)
         if not depth_img:
             self.report({'ERROR'}, "深度图渲染失败"); return {'CANCELLED'}
@@ -872,12 +945,7 @@ class PSB_OT_BakeVisibilityMask(bpy.types.Operator):
                 # 备份材质槽
                 orig_mats = [m for m in obj.data.materials]
 
-                # —— 构建只输出可见性颜色的材质（复用你原逻辑）——
-                # 省略：节点构建与上面一致（正面判定 + 深度测试）
-                # 与你原版相同，仅在保存时使用每个 obj 的名字
-                # （为了避免重复贴长代码，这里建议直接复制你现有 execute 中“节点构建”段落）
-
-                # === 直接复用你现有的节点构建代码块（从这里起到烘焙结束），唯一差异是保存路径： ===
+                # —— 可见性着色 ——（与原逻辑一致）
                 mat = bpy.data.materials.new(name="PSB_VisMaskBakeMat")
                 mat.use_nodes = True
                 nt = mat.node_tree
@@ -970,6 +1038,10 @@ class PSB_OT_BakeVisibilityMask(bpy.types.Operator):
                 orig_engine = scene.render.engine
                 try:
                     scene.render.engine = 'CYCLES'
+
+                    if use_gpu_depth:
+                        _enable_cycles_gpu(scene)
+
                     bpy.ops.object.select_all(action='DESELECT')
                     obj.select_set(True); context.view_layer.objects.active = obj
                     if hasattr(scene, "cycles"): scene.cycles.samples = 1
@@ -978,7 +1050,7 @@ class PSB_OT_BakeVisibilityMask(bpy.types.Operator):
                     scene.render.bake.margin = 2
                     bpy.ops.object.bake(type='EMIT')
 
-                    mask_path = os.path.join(out_dir, f"{obj.name}_visibility_mask.png")
+                    mask_path = make_outpath(bake_dir, "vismask", obj.name, "png")
                     target_img.filepath_raw = mask_path
                     target_img.file_format = 'PNG'
                     target_img.save()
@@ -1005,7 +1077,7 @@ class PSB_OT_BakeVisibilityMask(bpy.types.Operator):
                 except: pass
 
         if last_mask_path:
-            p.mask_path = bpy.path.relpath(last_mask_path)
+            p.mask_path = last_mask_path  # 绝对路径
         self.report({'INFO'}, f"已保存可见性遮罩：{saved_count} 个对象（模式：{used}）")
         return {'FINISHED'}
 
@@ -1013,493 +1085,88 @@ class PSB_OT_BakeVisibilityMask(bpy.types.Operator):
 
 
 
-# === 并行烘焙（临时脚本 + --python） =========================================
-import subprocess, sys, shlex, tempfile, time, textwrap
-from pathlib import Path
+# ========= 贴到 apply_ops.py（与其它函数/类并列）=========
 
-class PSB_OT_ApplyPaint3DParallel(bpy.types.Operator):
-    bl_idname = "psb.apply_paint3d_parallel"
-    bl_label  = "并行烘焙（多进程）"
-    bl_options = {'REGISTER'}
+def _psb_defaults_dict():
+    """
+    返回 PSB_ExporterProps 的默认值字典。
+    只对 props 上存在的同名属性生效（hasattr 检查），
+    所以就算你后续新增/删改了属性也不会报错。
+    """
+    return {
+        # ① 目标/来源/基本导出
+        "bake_target_mode": "SINGLE",
+        "target_collection": None,
+        "render_mode": "CAMERA",
+        "camera": None,
+        "target_object": None,
+        "out_dir": "",
+        "uv_size": 4096,
+        "viewport_width": 1920,
+        "viewport_height": 1080,
 
-    def execute(self, context):
-        scene = context.scene
-        p = scene.psb_exporter
+        # ② 路径（导出后会被自动写入，这里重置为空）
+        "meta_path": "",
+        "paint_uv_path": "",
+        "paint_3d_path": "",
+        "baked_path": "",
 
-        # 基础检查
-        targets = pick_bake_targets(p)
-        if not targets:
-            self.report({'ERROR'}, "未找到要处理的网格物体")
-            return {'CANCELLED'}
+        # ③ 遮挡/遮罩（导出/烘焙前配置）
+        "mask_visible_color": (0.0, 0.0, 0.0, 1.0),
+        "mask_hidden_color": (1.0, 1.0, 1.0, 1.0),
+        "mask_front_threshold": 0.5,
+        "depth_epsilon_ratio": 0.001,
+        "mask_invert_facing": True,
 
-        if not p.paint_3d_path or not os.path.exists(bpy.path.abspath(p.paint_3d_path)):
-            self.report({'ERROR'}, "未设置或找不到 3D 绘制 PNG 路径")
-            return {'CANCELLED'}
+        # ④ 烘焙相关
+        "bake_background_color": (1.0, 1.0, 1.0, 0.0),
 
-        if not p.meta_path or not os.path.exists(bpy.path.abspath(p.meta_path)):
-            self.report({'ERROR'}, "未设置或找不到 metadata JSON 路径")
-            return {'CANCELLED'}
+        # ⑤ 性能 / 并行
+        "use_gpu": True,
+        "parallel_workers": 0,
 
-        out_dir = Path(bpy.path.abspath(p.out_dir))
-        out_dir.mkdir(parents=True, exist_ok=True)
+        # 若你后来新增了第二个 GPU 开关（例：use_gpu_bake / use_gpu_depth），
+        # 在此添加默认值即可，没定义则不会设置：
+        # "use_gpu_depth": True,
+        # "use_gpu_bake": True,
+    }
 
-        blend_path = bpy.data.filepath
-        if not blend_path:
-            self.report({'ERROR'}, "请先保存 .blend 文件后再并行烘焙（子进程需要载入此文件）")
-            return {'CANCELLED'}
 
-        blender_exe = bpy.app.binary_path
-        paint_3d_path = bpy.path.abspath(p.paint_3d_path)
-        meta_path     = bpy.path.abspath(p.meta_path)
-        bake_bg       = tuple(getattr(p, "bake_background_color", (1,1,1,0)))
-        use_gpu       = bool(getattr(p, "use_gpu", False))
-        max_workers   = max(1, int(getattr(p, "parallel_workers", 1)))
-
-        # 日志文件（主进程汇总）
-        log_path = out_dir / "parallel_bake_log.txt"
-        with open(log_path, "w", encoding="utf-8") as f:
-            f.write(f"[并行烘焙启动] {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Blender: {bpy.app.version_string}, 文件: {bpy.data.filepath}\n")
-            f.write(f"目标数量: {len(targets)}, GPU: {use_gpu}, 进程数: {max_workers}\n\n")
-
-        # 子进程 GPU 片段
-        gpu_snippet = textwrap.dedent("""
-            import bpy
+def _reset_psb_props(props):
+    """将 props 上与默认表匹配的字段恢复为默认值。"""
+    defaults = _psb_defaults_dict()
+    for k, v in defaults.items():
+        if hasattr(props, k):
             try:
-                prefs = bpy.context.preferences.addons['cycles'].preferences
-                dev_order = ['OPTIX','CUDA','HIP','ONEAPI','METAL']
-                ok_type = None
-                for t in dev_order:
-                    try:
-                        prefs.compute_device_type = t
-                        _ = prefs.get_devices()
-                        ok_type = t
-                        break
-                    except Exception:
-                        pass
-                if ok_type:
-                    for _grp, devs in prefs.get_devices():
-                        for d in devs:
-                            d.use = True
-                    bpy.context.scene.cycles.device = 'GPU'
-                else:
-                    bpy.context.scene.cycles.device = 'CPU'
-            except Exception as _e:
-                bpy.context.scene.cycles.device = 'CPU'
-        """).strip()
-
-        # 为每个对象写临时脚本
-        jobs = []
-        for obj in targets:
-            obj_name = obj.name
-            
-            # 在 f-string 外部先准备好内容
-            gpu_or_cpu = "# 使用 GPU\n" + gpu_snippet if use_gpu else "bpy.context.scene.cycles.device='CPU'"
-
-            # 然后在 f-string 里只写变量
-            script_text = f"""
-import bpy, os, sys, traceback
-print('[child] ==== start job: {obj_name} ====')
-
-# 确保插件可用（当前会话启用即可）
-try:
-    import Blender_Texture_Bridge
-    print('[child] addon already importable')
-except Exception as _e:
-    try:
-        bpy.ops.preferences.addon_enable(module='Blender_Texture_Bridge')
-        print('[child] addon enabled in session')
-    except Exception as _ee:
-        print('[child][WARN] addon_enable failed:', _ee)
-
-# GPU/CPU 切换
-{gpu_or_cpu}
-
-# 设置属性（单目标）
-p = bpy.context.scene.psb_exporter
-p.bake_target_mode = 'SINGLE'
-p.target_object = bpy.data.objects.get({repr(obj_name)})
-p.out_dir = {repr(str(out_dir))}
-p.paint_3d_path = {repr(paint_3d_path)}
-p.meta_path = {repr(meta_path)}
-p.bake_background_color = {repr(tuple(float(x) for x in bake_bg))}
-
-print('[child] target =', p.target_object.name if p.target_object else None)
-print('[child] out_dir =', p.out_dir)
-print('[child] paint_3d_path =', p.paint_3d_path)
-print('[child] meta_path =', p.meta_path)
-
-if p.target_object is None:
-    raise RuntimeError('target object not found: {obj_name}')
-
-# 调用现有 JSON 投影烘焙
-res = bpy.ops.psb.apply_paint3d()
-print('[child] bake_result =', res)
-print('[child] ==== end job: {obj_name} ====')
-"""
-
-            # 写入临时脚本文件
-            tf = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8")
-            tf.write(script_text)
-            tf.flush()
-            tf.close()
-            job_script = tf.name
-
-            cmd = [blender_exe, "-b", blend_path, "--python", job_script]
-            jobs.append({"name": obj_name, "cmd": cmd, "script": job_script})
-
-        # 进程池
-        running = []
-        idx = 0
-        success = 0
-        fail = 0
-
-        def _start(job):
-            print("[spawn]", job["name"], shlex.join(job["cmd"]))
-            proc = subprocess.Popen(job["cmd"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            job["proc"] = proc
-            job["stdout"] = []
-            job["stderr"] = []
-            return job
-
-        while idx < len(jobs) or running:
-            # 启动
-            while idx < len(jobs) and len(running) < max_workers:
-                running.append(_start(jobs[idx]))
-                idx += 1
-
-            # 轮询
-            still = []
-            for job in running:
-                proc = job["proc"]
-                out = proc.stdout.readline() if not proc.stdout.closed else ""
-                err = proc.stderr.readline() if not proc.stderr.closed else ""
-                if out: job["stdout"].append(out)
-                if err: job["stderr"].append(err)
-
-                if proc.poll() is None:
-                    still.append(job)
-                    continue
-
-                # 取完剩余输出
-                rest_out, rest_err = proc.communicate()
-                if rest_out: job["stdout"].append(rest_out)
-                if rest_err: job["stderr"].append(rest_err)
-
-                code = proc.returncode
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write("\n" + "="*60 + f"\n[Job] {job['name']} 退出码={code}\n")
-                    if job["stdout"]:
-                        f.write("[STDOUT]\n" + ("".join(job["stdout"])) + "\n")
-                    if job["stderr"]:
-                        f.write("[STDERR]\n" + ("".join(job["stderr"])) + "\n")
-
-                if code == 0:
-                    success += 1
-                    # 成功则删除临时脚本
-                    try: os.remove(job["script"])
-                    except: pass
-                else:
-                    fail += 1
-                    print(f"[PSB Parallel] 子进程失败：{job['name']}，脚本保留在：{job['script']}")
-
-            running = still
-            time.sleep(0.02)
-
-        total = len(jobs)
-        msg = f"并行烘焙完成：成功{success}/失败{fail}/总计{total}；日志：{str(log_path)}"
-        self.report({'INFO'}, msg)
-        print(msg)
-        return {'FINISHED'}
-# === 并行烘焙（临时脚本）结束 ================================================
-
-
-
-# === 子进程用：只烘焙一个物体 ===
-class PSB_OT__BakeSingleForParallel(bpy.types.Operator):
-    """（内部）只烘焙一个指定物体；供外部并行子进程调用"""
-    bl_idname = "psb._bake_single_for_parallel"
-    bl_label = "PSB 内部：子进程单物体烘焙"
-
-    obj_name: bpy.props.StringProperty(name="Object Name", default="")
-    force_use_gpu: bpy.props.BoolProperty(name="Use GPU", default=False)
-
-    def execute(self, context):
-        import math, json, os
-
-        p = context.scene.psb_exporter
-        obj = bpy.data.objects.get(self.obj_name)
-        if not obj or obj.type != 'MESH':
-            self.report({'ERROR'}, f"未找到网格物体：{self.obj_name}")
-            return {'CANCELLED'}
-
-        # === 可选：子进程里切换 Cycles 到 GPU ===
-        try:
-            if self.force_use_gpu:
-                prefs = bpy.context.preferences
-                cprefs = prefs.addons['cycles'].preferences
-                cprefs.compute_device_type = 'CUDA' if 'CUDA' in cprefs.get_device_types(bpy.context) else ('OPTIX' if 'OPTIX' in cprefs.get_device_types(bpy.context) else 'NONE')
-                for d in cprefs.devices:
-                    d.use = True
-                scene = context.scene
-                scene.render.engine = 'CYCLES'
-                scene.cycles.device = 'GPU'
-        except Exception as e:
-            print("[PSB] GPU配置失败：", e)
-
-        # === 下面基本复用你 PSB_OT_ApplyPaint3D.execute 里对“单个 obj”的逻辑 ===
-        # 读取元数据 / 源图 / 相机 / 深度图（一次性资源会在进程结束时释放，不影响主进程）
-        meta_path = bpy.path.abspath(p.meta_path)
-        if not meta_path or not os.path.exists(meta_path):
-            self.report({'ERROR'}, "未找到 metadata JSON"); return {'CANCELLED'}
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-
-        src_path = bpy.path.abspath(p.paint_3d_path)
-        if not src_path or not os.path.exists(src_path):
-            self.report({'ERROR'}, f"找不到 3D 绘制图片：{src_path}"); return {'CANCELLED'}
-        img_src = load_image_from_path(src_path)
-        try: img_src.reload()
-        except: pass
-        if hasattr(img_src, "colorspace_settings"):
-            img_src.colorspace_settings.name = 'sRGB'
-        try:
-            img_src.use_mipmap = False
-            img_src.use_interpolation = True
-        except: pass
-        paint_w, paint_h = int(img_src.size[0]), int(img_src.size[1])
-
-        cam_obj, cam_data, used = _camera_from_json(context, meta, paint_w, paint_h)
-
-        out_dir = bpy.path.abspath(p.out_dir); ensure_dir(out_dir)
-        depth_exr_path = os.path.join(out_dir, f"__psb_cam_depth_once__.exr")
-        saved_depth = _render_depth_map(context, cam_obj, paint_w, paint_h, depth_exr_path)
-        depth_img = load_image_from_path(saved_depth)
-        if hasattr(depth_img, "colorspace_settings"):
-            depth_img.colorspace_settings.name = 'Non-Color'
-        try:
-            depth_img.use_mipmap = False
-            depth_img.use_interpolation = False
-        except: pass
-
-        bg_rgba = tuple(getattr(p, "bake_background_color", (1.0, 1.0, 1.0, 0.0)))
-
-        # === 单物体烘焙主体（与你现有 execute 中 for obj in targets 的单体分支一致）===
-        try:
-            target_w, target_h = get_active_uv_image_size(obj)
-            if not target_w:
-                target_w = target_h = int(p.uv_size)
-            target_img = bpy.data.images.new(name=f"{obj.name}_Baked", width=target_w, height=target_h, alpha=True)
-
-            # 预填背景 + straight alpha
-            try:
-                target_img.alpha_mode = 'STRAIGHT'
-                target_img.use_alpha = True
-                if hasattr(target_img, "colorspace_settings"):
-                    target_img.colorspace_settings.name = 'sRGB'
-                fill = [bg_rgba[0], bg_rgba[1], bg_rgba[2], bg_rgba[3]] * (target_w * target_h)
-                target_img.pixels[:] = fill
-            except:
+                setattr(props, k, v)
+            except Exception:
+                # 个别属性（如 PointerProperty）在某些状态下可能拒绝赋值，直接忽略
                 pass
 
-            # UV Project
-            proj_uv = ensure_uv_map(obj, "PSB_ProjectedUV")
-            mod = obj.modifiers.new("PSB_UVProject", type='UV_PROJECT')
-            mod.uv_layer = proj_uv
-            proj = mod.projectors
-            if len(proj) < 1: proj.add()
-            proj[0].object = cam_obj
-            mod.aspect_x = float(paint_w) / max(1.0, float(paint_h))
-            mod.aspect_y = 1.0
 
-            # 备份材质
-            orig_mats = [m for m in obj.data.materials]
+class PSB_OT_ResetAllSettings(bpy.types.Operator):
+    """重置所有纹理桥设置为默认值"""
+    bl_idname = "psb.reset_all_settings"
+    bl_label = "重置所有设置"
+    bl_options = {'REGISTER', 'UNDO'}
 
-            # —— 临时材质（与你现有相同）——
-            mat = bpy.data.materials.new(name="PSB_TempBakeMat")
-            mat.use_nodes = True
-            nt = mat.node_tree
-            for n in list(nt.nodes): nt.nodes.remove(n)
+    def execute(self, context):
+        p = getattr(context.scene, "psb_exporter", None)
+        if p is None:
+            self.report({'ERROR'}, "未找到 PSB 设置（Scene.psb_exporter 不存在）")
+            return {'CANCELLED'}
 
-            out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (1060, 0)
-            emi = nt.nodes.new("ShaderNodeEmission");       emi.location = (860, 0)
+        _reset_psb_props(p)
 
-            tex = nt.nodes.new("ShaderNodeTexImage");       tex.location = (40, 0)
-            tex.image = img_src
-            tex.projection = 'FLAT'
-            tex.extension  = 'CLIP'
-            tex.interpolation = 'Linear'
-
-            uvn = nt.nodes.new("ShaderNodeUVMap");          uvn.location = (-220, -150); uvn.uv_map = proj_uv
-            nt.links.new(uvn.outputs["UV"], tex.inputs["Vector"])
-
-            depth_tex = nt.nodes.new("ShaderNodeTexImage"); depth_tex.location = (40, -300)
-            depth_tex.image = depth_img
-            depth_tex.interpolation = 'Closest'
-            depth_tex.projection = 'FLAT'
-            depth_tex.extension  = 'CLIP'
-            if hasattr(depth_tex, "color_space"): depth_tex.color_space = 'NONE'
-            nt.links.new(uvn.outputs["UV"], depth_tex.inputs["Vector"])
-
-            # —— 世界空间可见性 ——（与你现有一致）
-            geo = nt.nodes.new("ShaderNodeNewGeometry");        geo.location = (-460, -420)
-            pos_xf = nt.nodes.new("ShaderNodeVectorTransform"); pos_xf.location = (-260, -420)
-            pos_xf.vector_type = 'POINT'; pos_xf.convert_from = 'OBJECT'; pos_xf.convert_to = 'WORLD'
-            nt.links.new(geo.outputs["Position"], pos_xf.inputs["Vector"])
-
-            nrm_xf = nt.nodes.new("ShaderNodeVectorTransform"); nrm_xf.location = (-260, -520)
-            nrm_xf.vector_type = 'NORMAL'; nrm_xf.convert_from = 'OBJECT'; nrm_xf.convert_to = 'WORLD'
-            nt.links.new(geo.outputs["Normal"], nrm_xf.inputs["Vector"])
-
-            cam_loc = cam_obj.matrix_world.translation
-            camX = nt.nodes.new("ShaderNodeValue"); camX.outputs[0].default_value = float(cam_loc.x); camX.location = (-220, -640)
-            camY = nt.nodes.new("ShaderNodeValue"); camY.outputs[0].default_value = float(cam_loc.y); camY.location = (-220, -680)
-            camZ = nt.nodes.new("ShaderNodeValue"); camZ.outputs[0].default_value = float(cam_loc.z); camZ.location = (-220, -720)
-            cmb  = nt.nodes.new("ShaderNodeCombineXYZ");       cmb.location  = (-40,  -680)
-            nt.links.new(camX.outputs[0], cmb.inputs[0]); nt.links.new(camY.outputs[0], cmb.inputs[1]); nt.links.new(camZ.outputs[0], cmb.inputs[2])
-
-            vsub = nt.nodes.new("ShaderNodeVectorMath"); vsub.location = (160, -520); vsub.operation = 'SUBTRACT'
-            nt.links.new(cmb.outputs["Vector"], vsub.inputs[0]); nt.links.new(pos_xf.outputs["Vector"], vsub.inputs[1])
-
-            vnorm = nt.nodes.new("ShaderNodeVectorMath"); vnorm.location = (340, -520); vnorm.operation = 'NORMALIZE'
-            nt.links.new(vsub.outputs["Vector"], vnorm.inputs[0])
-
-            vdot = nt.nodes.new("ShaderNodeVectorMath"); vdot.location = (520, -520); vdot.operation = 'DOT_PRODUCT'
-            nt.links.new(nrm_xf.outputs["Vector"], vdot.inputs[0]); nt.links.new(vnorm.outputs["Vector"], vdot.inputs[1])
-
-            tdeg = float(getattr(p, "mask_front_threshold", 0.5) or 0.5)
-            cos_thresh = math.cos(math.radians(90.0 - tdeg))
-            step_face = nt.nodes.new("ShaderNodeMath"); step_face.location = (700, -520); step_face.operation = 'GREATER_THAN'
-            step_face.inputs[1].default_value = cos_thresh
-            nt.links.new(vdot.outputs["Value"], step_face.inputs[0])
-
-            dist = nt.nodes.new("ShaderNodeVectorMath"); dist.location = (520, -320); dist.operation = 'LENGTH'
-            nt.links.new(vsub.outputs["Vector"], dist.inputs[0])
-
-            # epsilon 基于包围盒
-            bbox = [obj.matrix_world @ v.co for v in obj.data.vertices]
-            if bbox:
-                import mathutils
-                mins = mathutils.Vector((min(pv.x for pv in bbox), min(pv.y for pv in bbox), min(pv.z for pv in bbox)))
-                maxs = mathutils.Vector((max(pv.x for pv in bbox), max(pv.y for pv in bbox), max(pv.z for pv in bbox)))
-                diag = (maxs - mins).length
-            else:
-                diag = 1.0
-            eps_prop = float(getattr(p, "depth_epsilon_ratio", 0.001) or 0.001)
-            eps_val = max(1e-6, eps_prop * diag)
-
-            add_eps = nt.nodes.new("ShaderNodeMath"); add_eps.location = (700, -320); add_eps.operation = 'ADD'
-            add_eps.inputs[1].default_value = eps_val
-            nt.links.new(depth_tex.outputs["Color"], add_eps.inputs[0])
-
-            depth_ok = nt.nodes.new("ShaderNodeMath"); depth_ok.location = (880, -320); depth_ok.operation = 'LESS_THAN'
-            nt.links.new(dist.outputs["Value"], depth_ok.inputs[0]); nt.links.new(add_eps.outputs["Value"], depth_ok.inputs[1])
-
-            and_vis = nt.nodes.new("ShaderNodeMath"); and_vis.location = (880, -420); and_vis.operation = 'MULTIPLY'
-            nt.links.new(step_face.outputs["Value"], and_vis.inputs[0]); nt.links.new(depth_ok.outputs["Value"], and_vis.inputs[1])
-
-            mask_socket = and_vis.outputs["Value"]
-            if getattr(p, "mask_invert_facing", False):
-                inv = nt.nodes.new("ShaderNodeMath"); inv.location = (920, -390); inv.operation = 'SUBTRACT'
-                inv.inputs[0].default_value = 1.0
-                nt.links.new(and_vis.outputs["Value"], inv.inputs[1])
-                mask_socket = inv.outputs["Value"]
-
-            mix = nt.nodes.new("ShaderNodeMixRGB"); mix.location = (640, 0); mix.blend_type = 'MIX'
-            mix.inputs["Color1"].default_value = (bg_rgba[0], bg_rgba[1], bg_rgba[2], 1.0)
-            nt.links.new(mask_socket, mix.inputs["Fac"])
-            nt.links.new(tex.outputs["Color"],  mix.inputs["Color2"])
-
-            nt.links.new(mix.outputs["Color"],  emi.inputs["Color"])
-            nt.links.new(emi.outputs["Emission"], out.inputs["Surface"])
-
-            target_node = nt.nodes.new("ShaderNodeTexImage"); target_node.location = (260, -240)
-            target_node.image = target_img
-            nt.nodes.active = target_node
-
-            if not obj.data.materials: obj.data.materials.append(mat)
-            else: obj.data.materials[0] = mat
-
-            # —— Bake 颜色 —— #
-            scene = context.scene
-            orig_engine = scene.render.engine
+        # 额外：把面板里显示的最近输出提示清空（若你用它显示结果）
+        if hasattr(p, "baked_path"):
             try:
-                scene.render.engine = 'CYCLES'
-                bpy.ops.object.select_all(action='DESELECT')
-                obj.select_set(True); context.view_layer.objects.active = obj
+                p.baked_path = ""
+            except Exception:
+                pass
 
-                if hasattr(scene, "cycles"): scene.cycles.samples = 1
-                scene.render.bake.use_clear = False
-                scene.render.bake.use_selected_to_active = False
-                scene.render.bake.margin = max(8, int(0.004 * max(target_w, target_h)))
-                bpy.ops.object.bake(type='EMIT')
-
-                # —— Bake 掩码 —— #
-                mask_img = bpy.data.images.new(name=f"{obj.name}_BakeMaskTmp", width=target_w, height=target_h, alpha=False)
-                mask_node = nt.nodes.new("ShaderNodeTexImage"); mask_node.location = (260, -520)
-                mask_node.image = mask_img
-                nt.nodes.active = mask_node
-
-                for link in list(nt.links):
-                    if link.to_node == emi and link.to_socket.name == "Color":
-                        nt.links.remove(link)
-                nt.links.new(mask_socket, emi.inputs["Color"])
-                bpy.ops.object.bake(type='EMIT')
-
-                # —— 合成 alpha —— #
-                target_img.pixels[:]  # load
-                mask_img.pixels[:]
-                col_buf = list(target_img.pixels[:])
-                msk_buf = list(mask_img.pixels[:])
-                bg_a = bg_rgba[3]
-                px_count = target_w * target_h
-                for i in range(px_count):
-                    mi = i * 4
-                    m = msk_buf[mi]
-                    if m < 0.0: m = 0.0
-                    elif m > 1.0: m = 1.0
-                    col_buf[mi+3] = m + (1.0 - m) * bg_a
-                target_img.pixels[:] = col_buf
-
-                baked_path = os.path.join(out_dir, f"{obj.name}_baked.png")
-                try:
-                    target_img.alpha_mode = 'STRAIGHT'
-                    target_img.use_alpha = True
-                    if hasattr(target_img, "colorspace_settings"):
-                        target_img.colorspace_settings.name = 'sRGB'
-                except:
-                    pass
-                target_img.filepath_raw = baked_path
-                target_img.file_format = 'PNG'
-                target_img.save()
-
-                if not os.path.exists(baked_path):
-                    self.report({'ERROR'}, f"未生成输出：{baked_path}")
-                    return {'CANCELLED'}
-
-            finally:
-                try: obj.modifiers.remove(mod)
-                except: pass
-                try:
-                    obj.data.materials.clear()
-                    for m in orig_mats:
-                        obj.data.materials.append(m)
-                except: pass
-                try: bpy.data.materials.remove(mat, do_unlink=True)
-                except: pass
-                scene.render.engine = orig_engine
-
-        finally:
-            # 清相机
-            if cam_data is not None:
-                try: bpy.data.objects.remove(cam_obj, do_unlink=True)
-                except: pass
-                try: bpy.data.cameras.remove(cam_data, do_unlink=True)
-                except: pass
-
-        self.report({'INFO'}, f"[子进程] 烘焙完成：{self.obj_name}")
+        self.report({'INFO'}, "已恢复默认设置")
         return {'FINISHED'}
-
 
 
 
