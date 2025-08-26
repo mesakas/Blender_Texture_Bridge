@@ -351,3 +351,205 @@ class PSB_OT_Export(bpy.types.Operator):
 
         self.report({'INFO'}, f"导出完成：图像与 3D 画布基于“{camera_name}”，{len(per_object_entries)} 个 UV 画布，元数据：{blend_base}_metadata.json")
         return {'FINISHED'}
+
+
+
+# —— 可选：本文件内的 GPU 开启工具（独立于 apply_ops）——
+def _enable_cycles_gpu_local(scene):
+    try:
+        prefs = bpy.context.preferences
+        cprefs = prefs.addons['cycles'].preferences
+    except Exception:
+        scene.cycles.device = 'CPU'
+        return
+    for b in ["OPTIX", "CUDA", "HIP", "METAL", "ONEAPI"]:
+        try:
+            cprefs.compute_device_type = b
+            for d in cprefs.get_devices_for_type(b):
+                d.use = True
+            scene.cycles.device = 'GPU'
+            return
+        except Exception:
+            continue
+    scene.cycles.device = 'CPU'
+
+
+class PSB_OT_RenderCameraMask(bpy.types.Operator):
+    """导出选中物体/集合在【相机】视角下的遮罩（对象为白，背景透明）"""
+    bl_idname = "psb.render_camera_mask"
+    bl_label  = "导出相机视角遮罩"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.psb_exporter
+        cam = props.camera
+        if not cam or getattr(cam, "type", "") != 'CAMERA':
+            self.report({'ERROR'}, "请先在面板选择一个相机")
+            return {'CANCELLED'}
+
+        from .utils import pick_bake_targets, ensure_dir
+        targets = pick_bake_targets(props)
+        if not targets:
+            self.report({'ERROR'}, "未找到要导出的网格物体（请检查目标类型与目标选择）")
+            return {'CANCELLED'}
+
+        out_dir = bpy.path.abspath(props.out_dir)
+        ensure_dir(out_dir)
+
+        camera_name = cam.name
+        # 命名：<相机名>_camera_mask.png（固定文件名，允许覆盖）
+        out_path_noext = os.path.join(out_dir, f"{camera_name}_camera_mask")
+
+        scene = context.scene
+        view_layer = scene.view_layers[0]
+
+        # 记录现场
+        orig_cam = scene.camera
+        orig_engine = scene.render.engine
+        orig_filepath = scene.render.filepath
+        img = scene.render.image_settings
+        orig_format = img.file_format
+        orig_color_mode = img.color_mode
+        orig_color_depth = img.color_depth
+        orig_film = scene.render.film_transparent
+        orig_override = view_layer.material_override
+        orig_hide_map = {obj: obj.hide_render for obj in bpy.data.objects}
+
+        # 临时白色发光材质
+        mat = bpy.data.materials.new("PSB_Mask_White")
+        mat.use_nodes = True
+        nt = mat.node_tree
+        for n in list(nt.nodes): nt.nodes.remove(n)
+        out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (200, 0)
+        emi = nt.nodes.new("ShaderNodeEmission"); emi.location = (0, 0)
+        emi.inputs["Color"].default_value = (1, 1, 1, 1)
+        emi.inputs["Strength"].default_value = 1.0
+        nt.links.new(emi.outputs["Emission"], out.inputs["Surface"])
+
+        def _enable_cycles_gpu_local(scene):
+            try:
+                prefs = bpy.context.preferences
+                cprefs = prefs.addons['cycles'].preferences
+            except Exception:
+                scene.cycles.device = 'CPU'
+                return
+            for b in ["OPTIX", "CUDA", "HIP", "METAL", "ONEAPI"]:
+                try:
+                    cprefs.compute_device_type = b
+                    for d in cprefs.get_devices_for_type(b):
+                        d.use = True
+                    scene.cycles.device = 'GPU'
+                    return
+                except Exception:
+                    continue
+            scene.cycles.device = 'CPU'
+
+        try:
+            scene.camera = cam
+            scene.render.engine = 'CYCLES'
+            # 独立配置导出环节是否用 GPU（优先 use_gpu_export；否则退回 use_gpu）
+            if getattr(props, "use_gpu_export", getattr(props, "use_gpu", False)):
+                _enable_cycles_gpu_local(scene)
+
+            # 只让目标可渲染
+            for obj in bpy.data.objects:
+                obj.hide_render = (obj not in targets)
+
+            # 材质覆盖 + 背景透明，输出 RGBA
+            view_layer.material_override = mat
+            scene.render.film_transparent = True
+            scene.render.filepath = out_path_noext
+            img.file_format = 'PNG'
+            img.color_mode = 'RGBA'
+            img.color_depth = '8'
+
+            bpy.ops.render.render(write_still=True)
+            out_path = scene.render.filepath
+            if not out_path.lower().endswith(".png"):
+                out_path += ".png"
+
+        finally:
+            # 还原现场
+            for obj, hv in orig_hide_map.items():
+                try: obj.hide_render = hv
+                except: pass
+            view_layer.material_override = orig_override
+            scene.render.film_transparent = orig_film
+            scene.render.filepath = orig_filepath
+            img.file_format = orig_format
+            img.color_mode = orig_color_mode
+            img.color_depth = orig_color_depth
+            scene.render.engine = orig_engine
+            scene.camera = orig_cam
+            try: bpy.data.materials.remove(mat, do_unlink=True)
+            except: pass
+
+        try: props.mask_path = out_path
+        except: pass
+
+        self.report({'INFO'}, f"已导出遮罩：{out_path}")
+        return {'FINISHED'}
+
+
+class PSB_OT_RenderCameraStill(bpy.types.Operator):
+    """从选定【相机】渲染一张 PNG 到输出目录，命名为 <相机名>_camera_序号.png"""
+    bl_idname = "psb.render_camera_still"
+    bl_label  = "从相机渲染新图"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.psb_exporter
+        cam = props.camera
+        if not cam or getattr(cam, "type", "") != 'CAMERA':
+            self.report({'ERROR'}, "请先在面板选择一个相机")
+            return {'CANCELLED'}
+
+        from .utils import ensure_dir
+        out_dir = bpy.path.abspath(props.out_dir)
+        ensure_dir(out_dir)
+
+        camera_name = cam.name
+
+        # 计算下一个序号（从 1 开始，三位补零）
+        def next_index(out_dir, cam_name):
+            prefix = f"{cam_name}_camera_"
+            max_idx = 0
+            try:
+                for fn in os.listdir(out_dir):
+                    if fn.startswith(prefix) and fn.lower().endswith(".png"):
+                        stem = fn[:-4]  # 去掉 .png
+                        part = stem[len(prefix):]
+                        if part.isdigit():
+                            max_idx = max(max_idx, int(part))
+            except Exception:
+                pass
+            return max_idx + 1
+
+        idx = next_index(out_dir, camera_name)
+        out_path_noext = os.path.join(out_dir, f"{camera_name}_camera_{idx:03d}")
+
+        scene = context.scene
+        # 记录现场
+        orig_cam = scene.camera
+        orig_filepath = scene.render.filepath
+        img = scene.render.image_settings
+        orig_format = img.file_format
+
+        try:
+            scene.camera = cam
+            scene.render.filepath = out_path_noext
+            img.file_format = 'PNG'
+            bpy.ops.render.render(write_still=True)
+            out_path = scene.render.filepath
+            if not out_path.lower().endswith(".png"):
+                out_path += ".png"
+        finally:
+            scene.camera = orig_cam
+            scene.render.filepath = orig_filepath
+            img.file_format = orig_format
+
+        try: props.last_render_path = out_path
+        except: pass
+
+        self.report({'INFO'}, f"已渲染：{out_path}")
+        return {'FINISHED'}

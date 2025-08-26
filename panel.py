@@ -63,6 +63,13 @@ class PSB_PT_Panel(bpy.types.Panel):
         col.prop(p, "paint_3d_path", text="3D 绘制 PNG")
         col.separator()
 
+
+        # —— 新增：放在导出按钮上方 —— #
+        row = col.row(align=True)
+        row.operator("psb.render_camera_mask", text="导出相机视角遮罩（选择的目标/集合）", icon="IMAGE_ALPHA")
+        row = col.row(align=True)
+        row.operator("psb.render_camera_still", text="从相机渲染新图", icon="RENDER_STILL")
+
         # 导出按钮（更醒目更大）
         row = col.row(align=True); row.scale_y = 1.7
         row.operator("psb.export_camera_uv", text="导出：渲染 + 相机参数 + UV", icon="EXPORT")

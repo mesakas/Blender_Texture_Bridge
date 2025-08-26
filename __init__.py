@@ -45,6 +45,8 @@ else:
 # --- 注册表 ---
 classes = (
     properties.PSB_ExporterProps,
+    export_ops.PSB_OT_RenderCameraMask,
+    export_ops.PSB_OT_RenderCameraStill,
     export_ops.PSB_OT_Export,
     apply_ops.PSB_OT_CreateBlankCanvases,
     apply_ops.PSB_OT_ApplyPaint3D,
